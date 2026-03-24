@@ -1265,15 +1265,16 @@ def pick_best_credential(base_key, base_secret, base_token,
 
 def attempt_role_assumption(key_id, secret, token, region, timeout,
                              role_name, accounts, source_account,
-                             pull_secrets, out_dir):
+                             pull_secrets, out_dir, regions=None):
     sts = make_client("sts", key_id, secret, token, region, timeout)
     results = {}
+    regions = regions or DEFAULT_REGIONS
 
     all_accounts = dict(accounts)
     if source_account and source_account not in all_accounts:
         all_accounts[source_account] = f"account-{source_account}"
 
-    print(f"    [{ts()}] Testing {role_name} in {len(all_accounts)} account(s)...", flush=True)
+    print(f"    [{ts()}] Testing {role_name} in {len(all_accounts)} account(s) across {len(regions)} regions...", flush=True)
 
     for account_id, alias in all_accounts.items():
         role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
@@ -1303,20 +1304,16 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
                 "expiration": str(c["Expiration"]),
                 "eks_clusters": {},
                 "s3": {},
+                "ec2": {},
+                "ecr": {},
                 "ssm": {},
-                "secrets_manager": {}
+                "secrets_manager": {},
+                "rds": {},
+                "lambda": {},
+                "logs": {},
             }
 
-            # EKS
-            print(f"    [{ts()}]     EKS...", flush=True)
-            for r in DEFAULT_REGIONS:
-                eks_c = make_client("eks", ak, sk, st, r, timeout)
-                eks_r, _ = safe(eks_c.list_clusters)
-                if eks_r and eks_r.get("clusters"):
-                    entry["eks_clusters"][r] = eks_r["clusters"]
-                    print(f"    [{ts()}]       {r}: {eks_r['clusters']}", flush=True)
-
-            # S3
+            # S3 (global)
             print(f"    [{ts()}]     S3...", flush=True)
             s3_r = check_s3(ak, sk, st, region, timeout)
             entry["s3"] = s3_r
@@ -1324,21 +1321,68 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
                 print(f"    [{ts()}]       {s3_r['total']} buckets "
                       f"({len(s3_r.get('terraform_buckets',[]))} terraform)", flush=True)
 
-            # SSM
-            print(f"    [{ts()}]     SSM...", flush=True)
-            ssm_r = check_ssm(ak, sk, st, region, timeout,
-                               pull_secrets=pull_secrets,
-                               out_dir=out_dir,
-                               account_id=account_id)
-            entry["ssm"] = ssm_r
+            # All regional services
+            for r in regions:
+                print(f"    [{ts()}]     Region {r}...", flush=True)
 
-            # Secrets Manager
-            print(f"    [{ts()}]     Secrets Manager...", flush=True)
-            sm_r = check_secrets_manager(ak, sk, st, region, timeout,
-                                          pull_secrets=pull_secrets,
-                                          out_dir=out_dir,
-                                          account_id=account_id)
-            entry["secrets_manager"] = sm_r
+                # EKS
+                eks_c = make_client("eks", ak, sk, st, r, timeout)
+                eks_r, _ = safe(eks_c.list_clusters)
+                if eks_r and eks_r.get("clusters"):
+                    entry["eks_clusters"][r] = eks_r["clusters"]
+                    print(f"    [{ts()}]       EKS: {eks_r['clusters']}", flush=True)
+
+                # EC2
+                ec2 = check_ec2(ak, sk, st, r, timeout)
+                inst = ec2.get("running_count", 0)
+                vpcs = len(ec2.get("vpcs", []))
+                if inst > 0 or vpcs > 0:
+                    entry["ec2"][r] = ec2
+                    print(f"    [{ts()}]       EC2: {inst} instances, {vpcs} VPCs", flush=True)
+
+                # ECR
+                ecr = check_ecr(ak, sk, st, r, timeout)
+                if ecr["total"] > 0:
+                    entry["ecr"][r] = ecr
+                    print(f"    [{ts()}]       ECR: {ecr['total']} repos", flush=True)
+
+                # SSM
+                ssm_r = check_ssm(ak, sk, st, r, timeout,
+                                   pull_secrets=pull_secrets,
+                                   out_dir=out_dir,
+                                   account_id=account_id)
+                if ssm_r.get("managed_instances_count", 0) > 0 or ssm_r.get("parameter_count", 0) > 0:
+                    entry["ssm"][r] = ssm_r
+                    print(f"    [{ts()}]       SSM: {ssm_r.get('managed_instances_count',0)} instances, "
+                          f"{ssm_r.get('parameter_count',0)} params", flush=True)
+
+                # Secrets Manager
+                sm_r = check_secrets_manager(ak, sk, st, r, timeout,
+                                              pull_secrets=pull_secrets,
+                                              out_dir=out_dir,
+                                              account_id=account_id)
+                if "error" not in sm_r and sm_r.get("total", 0) > 0:
+                    entry["secrets_manager"][r] = sm_r
+                    print(f"    [{ts()}]       SM: {sm_r['total']} secrets", flush=True)
+
+                # RDS
+                rds = check_rds(ak, sk, st, r, timeout)
+                if rds.get("instances") or rds.get("clusters"):
+                    entry["rds"][r] = rds
+                    print(f"    [{ts()}]       RDS: {len(rds.get('instances',[]))} instances, "
+                          f"{len(rds.get('clusters',[]))} clusters", flush=True)
+
+                # Lambda
+                lam = check_lambda(ak, sk, st, r, timeout)
+                if lam["total"] > 0:
+                    entry["lambda"][r] = lam
+                    print(f"    [{ts()}]       Lambda: {lam['total']} functions", flush=True)
+
+                # CloudWatch Logs
+                logs = check_logs(ak, sk, st, r, timeout)
+                if "error" not in logs and logs.get("total", 0) > 0:
+                    entry["logs"][r] = logs
+                    print(f"    [{ts()}]       Logs: {logs['total']} groups", flush=True)
 
             # Get alias for the assumed account
             assumed_alias_data, _ = safe(
@@ -1348,9 +1392,21 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
             if assumed_alias:
                 entry["account_alias_confirmed"] = assumed_alias
 
+            # Print totals
+            eks_t = sum(len(c) for c in entry["eks_clusters"].values())
+            ec2_t = sum(v.get("running_count", 0) for v in entry["ec2"].values())
+            ecr_t = sum(v.get("total", 0) for v in entry["ecr"].values())
+            ssm_p = sum(v.get("parameter_count", 0) for v in entry["ssm"].values())
+            ssm_i = sum(v.get("managed_instances_count", 0) for v in entry["ssm"].values())
+            sm_t = sum(v.get("total", 0) for v in entry["secrets_manager"].values())
+            rds_t = sum(len(v.get("instances", [])) for v in entry["rds"].values())
+            lam_t = sum(v.get("total", 0) for v in entry["lambda"].values())
+
             results[account_id] = entry
             alias_display = assumed_alias or alias
             print(f"    [{ts()}]   ✓ SUCCESS — {alias_display} ({account_id})", flush=True)
+            print(f"    [{ts()}]     Totals: EKS={eks_t} EC2={ec2_t} ECR={ecr_t} "
+                  f"SSM={ssm_p}p/{ssm_i}i SM={sm_t} RDS={rds_t} Lambda={lam_t}", flush=True)
 
         else:
             results[account_id] = {
@@ -1748,7 +1804,8 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
             accounts=assume_accounts,
             source_account=account_id,
             pull_secrets=pull,
-            out_dir=out_dir
+            out_dir=out_dir,
+            regions=regions
         )
         result["role_assumption"] = assumed
 
@@ -1759,18 +1816,21 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
                 cross = " (cross-account)" if data.get("cross_account") else " (own account)"
                 print(f"[{ts()}]     → {data['account_alias']} ({aid}){cross}", flush=True)
                 eks_t = sum(len(c) for c in data.get("eks_clusters", {}).values())
-                print(f"[{ts()}]       EKS : {eks_t} clusters", flush=True)
-                print(f"[{ts()}]       S3  : {data.get('s3',{}).get('total',0)} buckets", flush=True)
-                ssm_d = data.get("ssm", {})
-                print(f"[{ts()}]       SSM : {ssm_d.get('parameter_count',0)} params", flush=True)
-                if ssm_d.get("params_file"):
-                    print(f"[{ts()}]         → {ssm_d['params_file']}", flush=True)
-                if ssm_d.get("secrets_file"):
-                    print(f"[{ts()}]         → {ssm_d['secrets_file']}", flush=True)
-                sm_d = data.get("secrets_manager", {})
-                print(f"[{ts()}]       SM  : {sm_d.get('total',0)} secrets", flush=True)
-                if sm_d.get("names_file"):
-                    print(f"[{ts()}]         → {sm_d['names_file']}", flush=True)
+                ec2_t = sum(v.get("running_count", 0) for v in data.get("ec2", {}).values() if isinstance(v, dict))
+                ecr_t = sum(v.get("total", 0) for v in data.get("ecr", {}).values() if isinstance(v, dict))
+                ssm_p = sum(v.get("parameter_count", 0) for v in data.get("ssm", {}).values() if isinstance(v, dict))
+                ssm_i = sum(v.get("managed_instances_count", 0) for v in data.get("ssm", {}).values() if isinstance(v, dict))
+                sm_t = sum(v.get("total", 0) for v in data.get("secrets_manager", {}).values() if isinstance(v, dict))
+                rds_t = sum(len(v.get("instances", [])) for v in data.get("rds", {}).values() if isinstance(v, dict))
+                lam_t = sum(v.get("total", 0) for v in data.get("lambda", {}).values() if isinstance(v, dict))
+                print(f"[{ts()}]       S3     : {data.get('s3',{}).get('total',0)} buckets", flush=True)
+                print(f"[{ts()}]       EC2    : {ec2_t} instances", flush=True)
+                print(f"[{ts()}]       EKS    : {eks_t} clusters", flush=True)
+                print(f"[{ts()}]       ECR    : {ecr_t} repos", flush=True)
+                print(f"[{ts()}]       SSM    : {ssm_p} params, {ssm_i} managed instances", flush=True)
+                print(f"[{ts()}]       SM     : {sm_t} secrets", flush=True)
+                print(f"[{ts()}]       RDS    : {rds_t} instances", flush=True)
+                print(f"[{ts()}]       Lambda : {lam_t} functions", flush=True)
         else:
             print(f"[{ts()}]   All attempts denied", flush=True)
     else:
