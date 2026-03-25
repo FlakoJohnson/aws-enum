@@ -933,13 +933,13 @@ def check_ssm(key_id, secret, token, region, timeout,
                 ptype = param_types.get(name, "")
                 f.write(f"[{ptype:14s}] {name}\n")
         result["params_file"] = names_file
-        print(f"    [{ts()}]   SSM names saved → {names_file}", flush=True)
+        print(f"    {ts()}   SSM names saved → {names_file}", flush=True)
 
     # Optionally pull values
     if pull_secrets and param_names:
         values_file = os.path.join(out_dir, f"ssm_secrets_{account_id}_{region}.txt")
         readable = {}
-        print(f"    [{ts()}]   Pulling {len(param_names)} SSM values...", flush=True)
+        print(f"    {ts()}   Pulling {len(param_names)} SSM values...", flush=True)
         for name in param_names:
             val, _ = safe(client.get_parameter, Name=name, WithDecryption=True)
             if val:
@@ -955,7 +955,7 @@ def check_ssm(key_id, secret, token, region, timeout,
                 f.write(f"[{data['type']:14s}] {name}\n  VALUE: {data['value']}\n\n")
         result["secrets_file"] = values_file
         result["readable_count"] = len(readable)
-        print(f"    [{ts()}]   SSM values ({len(readable)} readable) → {values_file}", flush=True)
+        print(f"    {ts()}   SSM values ({len(readable)} readable) → {values_file}", flush=True)
 
     # Test GetParameter access
     if param_names:
@@ -1018,7 +1018,7 @@ def check_secrets_manager(key_id, secret, token, region, timeout,
                     f.write(f"  Description  : {s['Description']}\n")
                 f.write(f"  Last changed : {s.get('LastChangedDate','N/A')}\n\n")
         result["names_file"] = names_file
-        print(f"    [{ts()}]   SM names saved → {names_file}", flush=True)
+        print(f"    {ts()}   SM names saved → {names_file}", flush=True)
 
     if pull_secrets and secret_names:
         values_file = os.path.join(out_dir, f"sm_secrets_{account_id}_{region}.txt")
@@ -1035,7 +1035,7 @@ def check_secrets_manager(key_id, secret, token, region, timeout,
                 f.write(f"{name}\n  VALUE: {value}\n\n")
         result["values_file"] = values_file
         result["readable_count"] = len(readable)
-        print(f"    [{ts()}]   SM values ({len(readable)} readable) → {values_file}", flush=True)
+        print(f"    {ts()}   SM values ({len(readable)} readable) → {values_file}", flush=True)
 
     return result
 
@@ -1202,13 +1202,13 @@ def pick_best_credential(base_key, base_secret, base_token,
         all_accounts[source_account] = f"account-{source_account}"
 
     for acct_id, alias in all_accounts.items():
-        print(f"  [{ts()}]   Trying {role_name} @ {alias} ({acct_id})...", flush=True)
+        print(f"  {ts()}   Trying {role_name} @ {alias} ({acct_id})...", flush=True)
         creds = try_assume_role(base_key, base_secret, base_token,
                                 region, timeout, role_name, acct_id)
         if not creds:
-            print(f"  [{ts()}]     ✗ Denied", flush=True)
+            print(f"  {ts()}     ✗ Denied", flush=True)
             continue
-        print(f"  [{ts()}]     ✓ Assumed", flush=True)
+        print(f"  {ts()}     ✓ Assumed", flush=True)
         ak, sk, st, role_arn = creds
         assumed_identity, _ = check_identity(ak, sk, st, region, timeout)
         assumed_allowed = 0
@@ -1219,7 +1219,7 @@ def pick_best_credential(base_key, base_secret, base_token,
             assumed_privs = check_privs(ak, sk, st, region, timeout, sim_identity)
             assumed_allowed = count_allowed(assumed_privs)
             if assumed_allowed == 0 and "error" in assumed_privs:
-                print(f"    [{ts()}]   ⚠ Priv sim failed for assumed role: {assumed_privs['error']}", flush=True)
+                print(f"    {ts()}   ⚠ Priv sim failed for assumed role: {assumed_privs['error']}", flush=True)
                 # Fall back to counting accessible services directly
                 s3_test, _ = safe(make_client("s3", ak, sk, st, region, timeout).list_buckets)
                 eks_test, _ = safe(make_client("eks", ak, sk, st, "us-west-2", timeout).list_clusters)
@@ -1229,7 +1229,7 @@ def pick_best_credential(base_key, base_secret, base_token,
                     20 if eks_test else 0,
                     10 if ssm_test else 0,
                 ])
-                print(f"    [{ts()}]   ↳ Estimated allowed (service probes): {assumed_allowed}", flush=True)
+                print(f"    {ts()}   ↳ Estimated allowed (service probes): {assumed_allowed}", flush=True)
 
         candidates.append({
             "key_id": ak,
@@ -1246,16 +1246,16 @@ def pick_best_credential(base_key, base_secret, base_token,
     # Pick the one with most allowed actions
     best = max(candidates, key=lambda x: x["allowed"])
 
-    print(f"[{ts()}]   Privilege comparison:", flush=True)
+    print(f"{ts()}   Privilege comparison:", flush=True)
     for c in candidates:
         marker = "★" if c == best else " "
         alias_str = f" [{c.get('account_alias','')}]" if c.get('account_alias') else ""
-        print(f"[{ts()}]   {marker} {c['label']:50s}{alias_str} — {c['allowed']} allowed actions", flush=True)
+        print(f"{ts()}   {marker} {c['label']:50s}{alias_str} — {c['allowed']} allowed actions", flush=True)
 
     if best["is_base"]:
-        print(f"[{ts()}]   → Using base credential (highest privilege)", flush=True)
+        print(f"{ts()}   → Using base credential (highest privilege)", flush=True)
     else:
-        print(f"[{ts()}]   → Using assumed role: {best['label']} (higher privilege)", flush=True)
+        print(f"{ts()}   → Using assumed role: {best['label']} (higher privilege)", flush=True)
 
     return (best["key_id"], best["secret"], best["token"],
             best["label"], best["arn"], candidates)
@@ -1274,12 +1274,12 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
     if source_account and source_account not in all_accounts:
         all_accounts[source_account] = f"account-{source_account}"
 
-    print(f"    [{ts()}] Testing {role_name} in {len(all_accounts)} account(s) across {len(regions)} regions...", flush=True)
+    print(f"    {ts()} Testing {role_name} in {len(all_accounts)} account(s) across {len(regions)} regions...", flush=True)
 
     for account_id, alias in all_accounts.items():
         role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
         cross = "(cross)" if account_id != source_account else "(own)"
-        print(f"    [{ts()}]   {alias} ({account_id}) {cross}...", flush=True)
+        print(f"    {ts()}   {alias} ({account_id}) {cross}...", flush=True)
 
         assumed, err = safe(
             sts.assume_role,
@@ -1314,23 +1314,23 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
             }
 
             # S3 (global)
-            print(f"    [{ts()}]     S3...", flush=True)
+            print(f"    {ts()}     S3...", flush=True)
             s3_r = check_s3(ak, sk, st, region, timeout)
             entry["s3"] = s3_r
             if "error" not in s3_r:
-                print(f"    [{ts()}]       {s3_r['total']} buckets "
+                print(f"    {ts()}       {s3_r['total']} buckets "
                       f"({len(s3_r.get('terraform_buckets',[]))} terraform)", flush=True)
 
             # All regional services
             for r in regions:
-                print(f"    [{ts()}]     Region {r}...", flush=True)
+                print(f"    {ts()}     Region {r}...", flush=True)
 
                 # EKS
                 eks_c = make_client("eks", ak, sk, st, r, timeout)
                 eks_r, _ = safe(eks_c.list_clusters)
                 if eks_r and eks_r.get("clusters"):
                     entry["eks_clusters"][r] = eks_r["clusters"]
-                    print(f"    [{ts()}]       EKS: {eks_r['clusters']}", flush=True)
+                    print(f"    {ts()}       EKS: {eks_r['clusters']}", flush=True)
 
                 # EC2
                 ec2 = check_ec2(ak, sk, st, r, timeout)
@@ -1338,13 +1338,13 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
                 vpcs = len(ec2.get("vpcs", []))
                 if inst > 0 or vpcs > 0:
                     entry["ec2"][r] = ec2
-                    print(f"    [{ts()}]       EC2: {inst} instances, {vpcs} VPCs", flush=True)
+                    print(f"    {ts()}       EC2: {inst} instances, {vpcs} VPCs", flush=True)
 
                 # ECR
                 ecr = check_ecr(ak, sk, st, r, timeout)
                 if ecr["total"] > 0:
                     entry["ecr"][r] = ecr
-                    print(f"    [{ts()}]       ECR: {ecr['total']} repos", flush=True)
+                    print(f"    {ts()}       ECR: {ecr['total']} repos", flush=True)
 
                 # SSM
                 ssm_r = check_ssm(ak, sk, st, r, timeout,
@@ -1353,7 +1353,7 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
                                    account_id=account_id)
                 if ssm_r.get("managed_instances_count", 0) > 0 or ssm_r.get("parameter_count", 0) > 0:
                     entry["ssm"][r] = ssm_r
-                    print(f"    [{ts()}]       SSM: {ssm_r.get('managed_instances_count',0)} instances, "
+                    print(f"    {ts()}       SSM: {ssm_r.get('managed_instances_count',0)} instances, "
                           f"{ssm_r.get('parameter_count',0)} params", flush=True)
 
                 # Secrets Manager
@@ -1363,26 +1363,26 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
                                               account_id=account_id)
                 if "error" not in sm_r and sm_r.get("total", 0) > 0:
                     entry["secrets_manager"][r] = sm_r
-                    print(f"    [{ts()}]       SM: {sm_r['total']} secrets", flush=True)
+                    print(f"    {ts()}       SM: {sm_r['total']} secrets", flush=True)
 
                 # RDS
                 rds = check_rds(ak, sk, st, r, timeout)
                 if rds.get("instances") or rds.get("clusters"):
                     entry["rds"][r] = rds
-                    print(f"    [{ts()}]       RDS: {len(rds.get('instances',[]))} instances, "
+                    print(f"    {ts()}       RDS: {len(rds.get('instances',[]))} instances, "
                           f"{len(rds.get('clusters',[]))} clusters", flush=True)
 
                 # Lambda
                 lam = check_lambda(ak, sk, st, r, timeout)
                 if lam["total"] > 0:
                     entry["lambda"][r] = lam
-                    print(f"    [{ts()}]       Lambda: {lam['total']} functions", flush=True)
+                    print(f"    {ts()}       Lambda: {lam['total']} functions", flush=True)
 
                 # CloudWatch Logs
                 logs = check_logs(ak, sk, st, r, timeout)
                 if "error" not in logs and logs.get("total", 0) > 0:
                     entry["logs"][r] = logs
-                    print(f"    [{ts()}]       Logs: {logs['total']} groups", flush=True)
+                    print(f"    {ts()}       Logs: {logs['total']} groups", flush=True)
 
             # Get alias for the assumed account
             assumed_alias_data, _ = safe(
@@ -1404,8 +1404,8 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
 
             results[account_id] = entry
             alias_display = assumed_alias or alias
-            print(f"    [{ts()}]   ✓ SUCCESS — {alias_display} ({account_id})", flush=True)
-            print(f"    [{ts()}]     Totals: EKS={eks_t} EC2={ec2_t} ECR={ecr_t} "
+            print(f"    {ts()}   ✓ SUCCESS — {alias_display} ({account_id})", flush=True)
+            print(f"    {ts()}     Totals: EKS={eks_t} EC2={ec2_t} ECR={ecr_t} "
                   f"SSM={ssm_p}p/{ssm_i}i SM={sm_t} RDS={rds_t} Lambda={lam_t}", flush=True)
 
         else:
@@ -1416,7 +1416,7 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
                 "role_arn": role_arn,
                 "error": err
             }
-            print(f"    [{ts()}]   ✗ {err}", flush=True)
+            print(f"    {ts()}   ✗ {err}", flush=True)
 
     return results
 
@@ -1438,14 +1438,14 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
     sep = "─" * 60
     print(f"\n{sep}")
-    print(f"[{ts()}] KEY: {key_id}")
+    print(f"{ts()} KEY: {key_id}")
     print(sep)
 
     # [1] Identity (base credential)
-    print(f"[{ts()}] [1] Identity...", flush=True)
+    print(f"{ts()} [1] Identity...", flush=True)
     identity, err = check_identity(key_id, secret, token, region, timeout)
     if err:
-        print(f"[{ts()}]   ✗ INVALID — {err}", flush=True)
+        print(f"{ts()}   ✗ INVALID — {err}", flush=True)
         result["status"] = "INVALID"
         result["error"] = err
         return result
@@ -1453,16 +1453,16 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     result["status"] = "VALID"
     result["identity"] = identity
     account_id = identity["account"]
-    print(f"[{ts()}]   ✓ ARN     : {identity['arn']}", flush=True)
-    print(f"[{ts()}]   ✓ Account : {account_id} ({identity.get('account_alias') or 'no alias'})", flush=True)
-    print(f"[{ts()}]   ✓ UserID  : {identity['user_id']}", flush=True)
-    print(f"[{ts()}]   ✓ Type    : {identity['key_type']}", flush=True)
+    print(f"{ts()}   ✓ ARN     : {identity['arn']}", flush=True)
+    print(f"{ts()}   ✓ Account : {account_id} ({identity.get('account_alias') or 'no alias'})", flush=True)
+    print(f"{ts()}   ✓ UserID  : {identity['user_id']}", flush=True)
+    print(f"{ts()}   ✓ Type    : {identity['key_type']}", flush=True)
     if identity.get("is_root"):
-        print(f"[{ts()}]   ⚠ ROOT ACCOUNT", flush=True)
+        print(f"{ts()}   ⚠ ROOT ACCOUNT", flush=True)
 
     # [1b] Role assumption + privilege comparison — pick best credential
     if not args.no_assume:
-        print(f"[{ts()}] [1b] Checking if assumed role has higher privilege...", flush=True)
+        print(f"{ts()} [1b] Checking if assumed role has higher privilege...", flush=True)
         e_key, e_secret, e_token, e_label, e_arn, all_candidates = pick_best_credential(
             key_id, secret, token,
             region, timeout,
@@ -1486,78 +1486,78 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
             # Re-fetch identity for the assumed role
             identity, _ = check_identity(key_id, secret, token, region, timeout)
             account_id = identity["account"] if identity else account_id
-            print(f"[{ts()}]   ★ Switching to: {e_label}", flush=True)
-            print(f"[{ts()}]     ARN: {e_arn}", flush=True)
+            print(f"{ts()}   ★ Switching to: {e_label}", flush=True)
+            print(f"{ts()}     ARN: {e_arn}", flush=True)
         else:
-            print(f"[{ts()}]   ✓ Base credential is most privileged — continuing", flush=True)
+            print(f"{ts()}   ✓ Base credential is most privileged — continuing", flush=True)
     else:
-        print(f"[{ts()}] [1b] Skipping role comparison (--no-assume)", flush=True)
+        print(f"{ts()} [1b] Skipping role comparison (--no-assume)", flush=True)
         result["credential_used"] = {"key_id": key_id, "label": "base", "arn": identity["arn"]}
 
     # [2] IAM
-    print(f"[{ts()}] [2] IAM...", flush=True)
+    print(f"{ts()} [2] IAM...", flush=True)
     iam = check_iam(key_id, secret, token, region, timeout, identity)
     result["iam"] = iam
     if iam.get("username"):
-        print(f"[{ts()}]   Username         : {iam['username']}", flush=True)
-        print(f"[{ts()}]   Created          : {iam.get('created','')}", flush=True)
-        print(f"[{ts()}]   Groups           : {iam.get('groups', [])}", flush=True)
-        print(f"[{ts()}]   Attached policies: {iam.get('attached_policies', [])}", flush=True)
-        print(f"[{ts()}]   Inline policies  : {iam.get('inline_policies', [])}", flush=True)
+        print(f"{ts()}   Username         : {iam['username']}", flush=True)
+        print(f"{ts()}   Created          : {iam.get('created','')}", flush=True)
+        print(f"{ts()}   Groups           : {iam.get('groups', [])}", flush=True)
+        print(f"{ts()}   Attached policies: {iam.get('attached_policies', [])}", flush=True)
+        print(f"{ts()}   Inline policies  : {iam.get('inline_policies', [])}", flush=True)
         if iam.get("access_keys"):
             for k in iam["access_keys"]:
-                print(f"[{ts()}]   Key: {k['key_id']} | {k['status']} | created {k['created']}", flush=True)
+                print(f"{ts()}   Key: {k['key_id']} | {k['status']} | created {k['created']}", flush=True)
     if iam.get("visible_users"):
-        print(f"[{ts()}]   Visible users : {len(iam['visible_users'])}", flush=True)
+        print(f"{ts()}   Visible users : {len(iam['visible_users'])}", flush=True)
     if iam.get("visible_roles"):
-        print(f"[{ts()}]   Visible roles : {len(iam['visible_roles'])}", flush=True)
+        print(f"{ts()}   Visible roles : {len(iam['visible_roles'])}", flush=True)
 
     # [3] Privilege simulation
     jitter(getattr(args, "stealth", False))
     if getattr(args, "stealth", False):
-        print(f"[{ts()}] [3] Privilege simulation — SKIPPED (stealth mode)", flush=True)
+        print(f"{ts()} [3] Privilege simulation — SKIPPED (stealth mode)", flush=True)
         result["privs"] = {"skipped": "stealth mode"}
     elif not args.fast:
-        print(f"[{ts()}] [3] Privilege simulation ({len(PRIV_CHECKS)} actions)...", flush=True)
+        print(f"{ts()} [3] Privilege simulation ({len(PRIV_CHECKS)} actions)...", flush=True)
         privs = check_privs(key_id, secret, token, region, timeout, identity)
         result["privs"] = privs
         if "allowed" in privs:
-            print(f"[{ts()}]   Allowed  : {len(privs['allowed'])}/{len(PRIV_CHECKS)}", flush=True)
+            print(f"{ts()}   Allowed  : {len(privs['allowed'])}/{len(PRIV_CHECKS)}", flush=True)
             if privs.get("high_value"):
-                print(f"[{ts()}]   ⚠ HIGH VALUE PERMISSIONS:", flush=True)
+                print(f"{ts()}   ⚠ HIGH VALUE PERMISSIONS:", flush=True)
                 for hv in privs["high_value"]:
-                    print(f"[{ts()}]     → {hv}", flush=True)
+                    print(f"{ts()}     → {hv}", flush=True)
         else:
-            print(f"[{ts()}]   {privs.get('error', 'no data')}", flush=True)
+            print(f"{ts()}   {privs.get('error', 'no data')}", flush=True)
     else:
-        print(f"[{ts()}] [3] Skipping priv simulation (--fast)", flush=True)
+        print(f"{ts()} [3] Skipping priv simulation (--fast)", flush=True)
         result["privs"] = {}
 
     # [3b] Privilege escalation path analysis
     allowed_actions = result.get("privs", {}).get("allowed", [])
     if allowed_actions:
-        print(f"[{ts()}] [3b] Privilege escalation path analysis...", flush=True)
+        print(f"{ts()} [3b] Privilege escalation path analysis...", flush=True)
         privesc = check_privesc_paths(allowed_actions, identity, iam)
         result["privesc_paths"] = privesc
         if privesc:
             critical = [p for p in privesc if p["risk"] == "CRITICAL"]
             high = [p for p in privesc if p["risk"] == "HIGH"]
             medium = [p for p in privesc if p["risk"] == "MEDIUM"]
-            print(f"[{ts()}]   ⚠ {len(privesc)} PRIVESC PATHS FOUND "
+            print(f"{ts()}   ⚠ {len(privesc)} PRIVESC PATHS FOUND "
                   f"({len(critical)} critical, {len(high)} high, {len(medium)} medium)", flush=True)
             for p in privesc:
                 risk_color = "⚠" if p["risk"] == "CRITICAL" else "→"
-                print(f"[{ts()}]   {risk_color} [{p['risk']}] {p['name']}", flush=True)
-                print(f"[{ts()}]     Actions : {', '.join(p['matched_actions'])}", flush=True)
-                print(f"[{ts()}]     Exploit : {p['exploit'][:120]}", flush=True)
+                print(f"{ts()}   {risk_color} [{p['risk']}] {p['name']}", flush=True)
+                print(f"{ts()}     Actions : {', '.join(p['matched_actions'])}", flush=True)
+                print(f"{ts()}     Exploit : {p['exploit'][:120]}", flush=True)
                 if p.get("targets"):
-                    print(f"[{ts()}]     Targets : {', '.join(p['targets'][:5])}{'...' if len(p.get('targets',[])) > 5 else ''}", flush=True)
+                    print(f"{ts()}     Targets : {', '.join(p['targets'][:5])}{'...' if len(p.get('targets',[])) > 5 else ''}", flush=True)
                 if p.get("assumable_roles"):
-                    print(f"[{ts()}]     Roles   : {', '.join(p['assumable_roles'][:5])}{'...' if len(p.get('assumable_roles',[])) > 5 else ''}", flush=True)
+                    print(f"{ts()}     Roles   : {', '.join(p['assumable_roles'][:5])}{'...' if len(p.get('assumable_roles',[])) > 5 else ''}", flush=True)
         else:
-            print(f"[{ts()}]   No known privesc paths with current permissions", flush=True)
+            print(f"{ts()}   No known privesc paths with current permissions", flush=True)
     else:
-        print(f"[{ts()}] [3b] Privesc analysis — skipped (no priv simulation data)", flush=True)
+        print(f"{ts()} [3b] Privesc analysis — skipped (no priv simulation data)", flush=True)
         result["privesc_paths"] = []
 
     # Save privesc paths to file if any found
@@ -1579,23 +1579,23 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
                 if p.get("assumable_roles"):
                     f.write(f"  Roles   : {', '.join(p['assumable_roles'])}\n")
                 f.write("\n")
-        print(f"[{ts()}]   Privesc paths saved → {privesc_file}", flush=True)
+        print(f"{ts()}   Privesc paths saved → {privesc_file}", flush=True)
 
     # [4] S3
     jitter(getattr(args, "stealth", False))
-    print(f"[{ts()}] [4] S3...", flush=True)
+    print(f"{ts()} [4] S3...", flush=True)
     s3 = check_s3(key_id, secret, token, region, timeout)
     result["s3"] = s3
     if "error" not in s3:
-        print(f"[{ts()}]   Total     : {s3['total']}", flush=True)
-        print(f"[{ts()}]   Terraform : {len(s3.get('terraform_buckets',[]))} buckets", flush=True)
-        print(f"[{ts()}]   Backup    : {len(s3.get('backup_buckets',[]))} buckets", flush=True)
-        print(f"[{ts()}]   Logs      : {len(s3.get('log_buckets',[]))} buckets", flush=True)
+        print(f"{ts()}   Total     : {s3['total']}", flush=True)
+        print(f"{ts()}   Terraform : {len(s3.get('terraform_buckets',[]))} buckets", flush=True)
+        print(f"{ts()}   Backup    : {len(s3.get('backup_buckets',[]))} buckets", flush=True)
+        print(f"{ts()}   Logs      : {len(s3.get('log_buckets',[]))} buckets", flush=True)
     else:
-        print(f"[{ts()}]   ✗ {s3['error']}", flush=True)
+        print(f"{ts()}   ✗ {s3['error']}", flush=True)
 
     # [5] EC2 — all regions
-    print(f"[{ts()}] [5] EC2 (all {len(regions)} regions)...", flush=True)
+    print(f"{ts()} [5] EC2 (all {len(regions)} regions)...", flush=True)
     result["ec2"] = {}
     ec2_total_inst = 0
     ec2_total_vpcs = 0
@@ -1607,31 +1607,31 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
             result["ec2"][r] = ec2
             ec2_total_inst += inst
             ec2_total_vpcs += vpcs
-            print(f"[{ts()}]   {r}: {inst} instances, {vpcs} VPCs", flush=True)
+            print(f"{ts()}   {r}: {inst} instances, {vpcs} VPCs", flush=True)
             for i in ec2.get("running_instances", [])[:3]:
-                print(f"[{ts()}]     {i['id']} | {i['type']} | {i.get('private_ip','')} | {i['name']}", flush=True)
+                print(f"{ts()}     {i['id']} | {i['type']} | {i.get('private_ip','')} | {i['name']}", flush=True)
     if ec2_total_inst == 0 and ec2_total_vpcs == 0:
-        print(f"[{ts()}]   Nothing accessible", flush=True)
-    print(f"[{ts()}]   Total: {ec2_total_inst} instances, {ec2_total_vpcs} VPCs", flush=True)
+        print(f"{ts()}   Nothing accessible", flush=True)
+    print(f"{ts()}   Total: {ec2_total_inst} instances, {ec2_total_vpcs} VPCs", flush=True)
 
     # [6] EKS via list-clusters API
     jitter(getattr(args, "stealth", False))
-    print(f"[{ts()}] [6] EKS clusters across {len(regions)} regions...", flush=True)
+    print(f"{ts()} [6] EKS clusters across {len(regions)} regions...", flush=True)
     eks = check_eks(key_id, secret, token, timeout, regions)
     result["eks"] = eks
     cluster_regions = {k: v for k, v in eks.items() if not k.endswith("_details")}
     if cluster_regions:
         total = sum(len(v) for v in cluster_regions.values())
-        print(f"[{ts()}]   ✓ {total} cluster(s) found:", flush=True)
+        print(f"{ts()}   ✓ {total} cluster(s) found:", flush=True)
         for r, clusters in cluster_regions.items():
             for c in clusters:
                 details = eks.get(f"{r}_details", {}).get(c, {})
-                print(f"[{ts()}]     {r} / {c} | {details.get('status','')} | k8s {details.get('version','')}", flush=True)
+                print(f"{ts()}     {r} / {c} | {details.get('status','')} | k8s {details.get('version','')}", flush=True)
     else:
-        print(f"[{ts()}]   No clusters accessible via list-clusters", flush=True)
+        print(f"{ts()}   No clusters accessible via list-clusters", flush=True)
 
     # [7] ECR — all regions
-    print(f"[{ts()}] [7] ECR (all {len(regions)} regions)...", flush=True)
+    print(f"{ts()} [7] ECR (all {len(regions)} regions)...", flush=True)
     result["ecr"] = {}
     ecr_total = 0
     for r in regions:
@@ -1639,20 +1639,20 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         if ecr["total"] > 0:
             result["ecr"][r] = ecr
             ecr_total += ecr["total"]
-            print(f"[{ts()}]   {r}: {ecr['total']} repos", flush=True)
-            print(f"[{ts()}]     Sample: {[x['name'] for x in ecr['repos'][:3]]}"
+            print(f"{ts()}   {r}: {ecr['total']} repos", flush=True)
+            print(f"{ts()}     Sample: {[x['name'] for x in ecr['repos'][:3]]}"
                   f"{'...' if ecr['total'] > 3 else ''}", flush=True)
     if ecr_total == 0:
-        print(f"[{ts()}]   Nothing accessible", flush=True)
-    print(f"[{ts()}]   Total across all regions: {ecr_total} repos", flush=True)
+        print(f"{ts()}   Nothing accessible", flush=True)
+    print(f"{ts()}   Total across all regions: {ecr_total} repos", flush=True)
 
     # [8] SSM — all regions
-    print(f"[{ts()}] [8] SSM (all {len(regions)} regions)...", flush=True)
+    print(f"{ts()} [8] SSM (all {len(regions)} regions)...", flush=True)
     result["ssm"] = {}
     ssm_total_params = 0
     ssm_total_instances = 0
     for r in regions:
-        print(f"[{ts()}]   → {r}...", flush=True)
+        print(f"{ts()}   → {r}...", flush=True)
         ssm = check_ssm(key_id, secret, token, r, timeout,
                         pull_secrets=pull, out_dir=out_dir,
                         account_id=f"{account_id}",
@@ -1663,46 +1663,46 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         ssm_total_params += param_count
         ssm_total_instances += inst_count
         if inst_count > 0 or param_count > 0:
-            print(f"[{ts()}]     Instances  : {inst_count}", flush=True)
+            print(f"{ts()}     Instances  : {inst_count}", flush=True)
             if ssm.get("managed_instances"):
                 for inst in ssm["managed_instances"][:3]:
-                    print(f"[{ts()}]       {inst['id']} | {inst['ip']} | {inst['platform']} | {inst['ping']}", flush=True)
-            print(f"[{ts()}]     Parameters : {param_count} ({ssm.get('secure_string_count',0)} SecureString)", flush=True)
+                    print(f"{ts()}       {inst['id']} | {inst['ip']} | {inst['platform']} | {inst['ping']}", flush=True)
+            print(f"{ts()}     Parameters : {param_count} ({ssm.get('secure_string_count',0)} SecureString)", flush=True)
             if ssm.get("params_file"):
-                print(f"[{ts()}]     Names  → {ssm['params_file']}", flush=True)
+                print(f"{ts()}     Names  → {ssm['params_file']}", flush=True)
             if ssm.get("secrets_file"):
-                print(f"[{ts()}]     Values → {ssm['secrets_file']} ({ssm.get('readable_count',0)} readable)", flush=True)
+                print(f"{ts()}     Values → {ssm['secrets_file']} ({ssm.get('readable_count',0)} readable)", flush=True)
             gpa = ssm.get("get_parameter_access", "NOT TESTED")
-            print(f"[{ts()}]     GetParameter : {'⚠' if 'ALLOWED' in str(gpa) else '✗'} {gpa}", flush=True)
+            print(f"{ts()}     GetParameter : {'⚠' if 'ALLOWED' in str(gpa) else '✗'} {gpa}", flush=True)
             sc = ssm.get("send_command_access", "NOT TESTED")
-            print(f"[{ts()}]     SendCommand  : {'⚠' if 'ALLOWED' in str(sc) else '✗'} {sc}", flush=True)
+            print(f"{ts()}     SendCommand  : {'⚠' if 'ALLOWED' in str(sc) else '✗'} {sc}", flush=True)
         else:
-            print(f"[{ts()}]     Nothing accessible", flush=True)
-    print(f"[{ts()}]   Total across all regions: {ssm_total_instances} instances, {ssm_total_params} params", flush=True)
+            print(f"{ts()}     Nothing accessible", flush=True)
+    print(f"{ts()}   Total across all regions: {ssm_total_instances} instances, {ssm_total_params} params", flush=True)
 
     # [9] Secrets Manager — all regions
-    print(f"[{ts()}] [9] Secrets Manager (all {len(regions)} regions)...", flush=True)
+    print(f"{ts()} [9] Secrets Manager (all {len(regions)} regions)...", flush=True)
     result["secrets_manager"] = {}
     sm_total = 0
     for r in regions:
-        print(f"[{ts()}]   → {r}...", flush=True)
+        print(f"{ts()}   → {r}...", flush=True)
         sm = check_secrets_manager(key_id, secret, token, r, timeout,
                                     pull_secrets=pull, out_dir=out_dir,
                                     account_id=f"{account_id}")
         result["secrets_manager"][r] = sm
         if "error" not in sm and sm.get("total", 0) > 0:
             sm_total += sm["total"]
-            print(f"[{ts()}]     {sm['total']} secrets", flush=True)
+            print(f"{ts()}     {sm['total']} secrets", flush=True)
             if sm.get("names_file"):
-                print(f"[{ts()}]     Names → {sm['names_file']}", flush=True)
+                print(f"{ts()}     Names → {sm['names_file']}", flush=True)
             if sm.get("values_file"):
-                print(f"[{ts()}]     Values → {sm['values_file']} ({sm.get('readable_count',0)} readable)", flush=True)
+                print(f"{ts()}     Values → {sm['values_file']} ({sm.get('readable_count',0)} readable)", flush=True)
         else:
-            print(f"[{ts()}]     Nothing accessible", flush=True)
-    print(f"[{ts()}]   Total across all regions: {sm_total} secrets", flush=True)
+            print(f"{ts()}     Nothing accessible", flush=True)
+    print(f"{ts()}   Total across all regions: {sm_total} secrets", flush=True)
 
     # [10] RDS — all regions
-    print(f"[{ts()}] [10] RDS (all {len(regions)} regions)...", flush=True)
+    print(f"{ts()} [10] RDS (all {len(regions)} regions)...", flush=True)
     result["rds"] = {}
     rds_total_inst = 0
     rds_total_clus = 0
@@ -1714,16 +1714,16 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
             result["rds"][r] = rds
             rds_total_inst += len(inst)
             rds_total_clus += len(clus)
-            print(f"[{ts()}]   {r}: {len(inst)} instances, {len(clus)} clusters", flush=True)
+            print(f"{ts()}   {r}: {len(inst)} instances, {len(clus)} clusters", flush=True)
             for i in inst:
-                print(f"[{ts()}]     {i['id']} | {i['engine']} | {i['endpoint']} | "
+                print(f"{ts()}     {i['id']} | {i['engine']} | {i['endpoint']} | "
                       f"public={i['publicly_accessible']}", flush=True)
     if rds_total_inst == 0 and rds_total_clus == 0:
-        print(f"[{ts()}]   Nothing accessible", flush=True)
-    print(f"[{ts()}]   Total: {rds_total_inst} instances, {rds_total_clus} clusters", flush=True)
+        print(f"{ts()}   Nothing accessible", flush=True)
+    print(f"{ts()}   Total: {rds_total_inst} instances, {rds_total_clus} clusters", flush=True)
 
     # [11] Lambda — all regions
-    print(f"[{ts()}] [11] Lambda (all {len(regions)} regions)...", flush=True)
+    print(f"{ts()} [11] Lambda (all {len(regions)} regions)...", flush=True)
     result["lambda"] = {}
     lambda_total = 0
     for r in regions:
@@ -1731,15 +1731,15 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         if lam["total"] > 0:
             result["lambda"][r] = lam
             lambda_total += lam["total"]
-            print(f"[{ts()}]   {r}: {lam['total']} functions", flush=True)
+            print(f"{ts()}   {r}: {lam['total']} functions", flush=True)
             for fn in lam["functions"][:3]:
-                print(f"[{ts()}]     {fn['name']} | {fn.get('runtime','')} | {fn.get('role','')[:60]}", flush=True)
+                print(f"{ts()}     {fn['name']} | {fn.get('runtime','')} | {fn.get('role','')[:60]}", flush=True)
     if lambda_total == 0:
-        print(f"[{ts()}]   Nothing accessible", flush=True)
-    print(f"[{ts()}]   Total: {lambda_total} functions", flush=True)
+        print(f"{ts()}   Nothing accessible", flush=True)
+    print(f"{ts()}   Total: {lambda_total} functions", flush=True)
 
     # [12] CloudWatch Logs — all regions
-    print(f"[{ts()}] [12] CloudWatch Logs (all {len(regions)} regions)...", flush=True)
+    print(f"{ts()} [12] CloudWatch Logs (all {len(regions)} regions)...", flush=True)
     result["logs"] = {}
     logs_total = 0
     for r in regions:
@@ -1747,34 +1747,34 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         if "error" not in logs and logs.get("total", 0) > 0:
             result["logs"][r] = logs
             logs_total += logs["total"]
-            print(f"[{ts()}]   {r}: {logs['total']} log groups", flush=True)
+            print(f"{ts()}   {r}: {logs['total']} log groups", flush=True)
     if logs_total == 0:
-        print(f"[{ts()}]   Nothing accessible", flush=True)
-    print(f"[{ts()}]   Total: {logs_total} log groups", flush=True)
+        print(f"{ts()}   Nothing accessible", flush=True)
+    print(f"{ts()}   Total: {logs_total} log groups", flush=True)
 
     # [13] Organizations
-    print(f"[{ts()}] [13] Organizations...", flush=True)
+    print(f"{ts()} [13] Organizations...", flush=True)
     org = check_org(key_id, secret, token, region, timeout)
     result["organizations"] = org
     if "error" not in org:
-        print(f"[{ts()}]   Org ID        : {org.get('org_id')}", flush=True)
-        print(f"[{ts()}]   Master account: {org.get('master_account')}", flush=True)
-        print(f"[{ts()}]   Master email  : {org.get('master_email')}", flush=True)
+        print(f"{ts()}   Org ID        : {org.get('org_id')}", flush=True)
+        print(f"{ts()}   Master account: {org.get('master_account')}", flush=True)
+        print(f"{ts()}   Master email  : {org.get('master_email')}", flush=True)
         if org.get("accounts_error"):
-            print(f"[{ts()}]   Accounts      : ✗ {org['accounts_error']}", flush=True)
+            print(f"{ts()}   Accounts      : ✗ {org['accounts_error']}", flush=True)
         elif org.get("accounts"):
-            print(f"[{ts()}]   Accounts      : {org.get('account_count',0)} (feeding into role assumption)", flush=True)
+            print(f"{ts()}   Accounts      : {org.get('account_count',0)} (feeding into role assumption)", flush=True)
             for a in org["accounts"]:
-                print(f"[{ts()}]     {a['id']} | {a['name']:40s} | {a['status']}", flush=True)
+                print(f"{ts()}     {a['id']} | {a['name']:40s} | {a['status']}", flush=True)
         else:
-            print(f"[{ts()}]   Accounts      : none enumerated", flush=True)
+            print(f"{ts()}   Accounts      : none enumerated", flush=True)
     else:
-        print(f"[{ts()}]   ✗ {org['error']}", flush=True)
+        print(f"{ts()}   ✗ {org['error']}", flush=True)
 
     # [14] Full role assumption — try all accounts (org-discovered + user-provided + own)
     if not args.no_assume:
         stealth_mode = getattr(args, "stealth", False)
-        print(f"[{ts()}] [14] Full role assumption "
+        print(f"{ts()} [14] Full role assumption "
               f"{'(own account only — stealth mode)' if stealth_mode else 'across all known accounts'}...",
               flush=True)
 
@@ -1783,7 +1783,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         if stealth_mode:
             # Stealth: only try own account to avoid cross-account CloudTrail noise
             assume_accounts[account_id] = f"account-{account_id}"
-            print(f"[{ts()}]   Stealth: limiting to own account only", flush=True)
+            print(f"{ts()}   Stealth: limiting to own account only", flush=True)
         else:
             assume_accounts = dict(extra_accounts)
             # Feed in org-discovered accounts
@@ -1791,12 +1791,12 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
                 for a in org["accounts"]:
                     if a["id"] not in assume_accounts:
                         assume_accounts[a["id"]] = a["name"]
-                print(f"[{ts()}]   {len(org['accounts'])} accounts from Organizations", flush=True)
+                print(f"{ts()}   {len(org['accounts'])} accounts from Organizations", flush=True)
             # Always include own account
             if account_id not in assume_accounts:
                 assume_accounts[account_id] = f"account-{account_id}"
 
-        print(f"[{ts()}]   Total targets: {len(assume_accounts)} accounts", flush=True)
+        print(f"{ts()}   Total targets: {len(assume_accounts)} accounts", flush=True)
 
         assumed = attempt_role_assumption(
             key_id, secret, token, region, timeout,
@@ -1811,10 +1811,10 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
         successes = {k: v for k, v in assumed.items() if v.get("status") == "SUCCESS"}
         if successes:
-            print(f"[{ts()}]   ⚠ ASSUMED {args.role_name} IN {len(successes)} ACCOUNT(S):", flush=True)
+            print(f"{ts()}   ⚠ ASSUMED {args.role_name} IN {len(successes)} ACCOUNT(S):", flush=True)
             for aid, data in successes.items():
                 cross = " (cross-account)" if data.get("cross_account") else " (own account)"
-                print(f"[{ts()}]     → {data['account_alias']} ({aid}){cross}", flush=True)
+                print(f"{ts()}     → {data['account_alias']} ({aid}){cross}", flush=True)
                 eks_t = sum(len(c) for c in data.get("eks_clusters", {}).values())
                 ec2_t = sum(v.get("running_count", 0) for v in data.get("ec2", {}).values() if isinstance(v, dict))
                 ecr_t = sum(v.get("total", 0) for v in data.get("ecr", {}).values() if isinstance(v, dict))
@@ -1823,18 +1823,18 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
                 sm_t = sum(v.get("total", 0) for v in data.get("secrets_manager", {}).values() if isinstance(v, dict))
                 rds_t = sum(len(v.get("instances", [])) for v in data.get("rds", {}).values() if isinstance(v, dict))
                 lam_t = sum(v.get("total", 0) for v in data.get("lambda", {}).values() if isinstance(v, dict))
-                print(f"[{ts()}]       S3     : {data.get('s3',{}).get('total',0)} buckets", flush=True)
-                print(f"[{ts()}]       EC2    : {ec2_t} instances", flush=True)
-                print(f"[{ts()}]       EKS    : {eks_t} clusters", flush=True)
-                print(f"[{ts()}]       ECR    : {ecr_t} repos", flush=True)
-                print(f"[{ts()}]       SSM    : {ssm_p} params, {ssm_i} managed instances", flush=True)
-                print(f"[{ts()}]       SM     : {sm_t} secrets", flush=True)
-                print(f"[{ts()}]       RDS    : {rds_t} instances", flush=True)
-                print(f"[{ts()}]       Lambda : {lam_t} functions", flush=True)
+                print(f"{ts()}       S3     : {data.get('s3',{}).get('total',0)} buckets", flush=True)
+                print(f"{ts()}       EC2    : {ec2_t} instances", flush=True)
+                print(f"{ts()}       EKS    : {eks_t} clusters", flush=True)
+                print(f"{ts()}       ECR    : {ecr_t} repos", flush=True)
+                print(f"{ts()}       SSM    : {ssm_p} params, {ssm_i} managed instances", flush=True)
+                print(f"{ts()}       SM     : {sm_t} secrets", flush=True)
+                print(f"{ts()}       RDS    : {rds_t} instances", flush=True)
+                print(f"{ts()}       Lambda : {lam_t} functions", flush=True)
         else:
-            print(f"[{ts()}]   All attempts denied", flush=True)
+            print(f"{ts()}   All attempts denied", flush=True)
     else:
-        print(f"[{ts()}] [14] Skipping role assumption (--no-assume)", flush=True)
+        print(f"{ts()} [14] Skipping role assumption (--no-assume)", flush=True)
         result["role_assumption"] = {}
 
     return result
@@ -1952,23 +1952,30 @@ if __name__ == "__main__":
     args = parse_args()
     banner()
 
-    if args.out_dir is None:
-        args.out_dir = os.path.join(os.getcwd(), f"aws_enum_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(args.out_dir, exist_ok=True)
-    print(f"[{ts()}] Out dir      : {args.out_dir}")
     extra_accounts = load_accounts(args)
     creds = load_credentials(args)
 
     if not creds:
-        print("[!] No valid credentials found", file=sys.stderr)
+        print(f"{ts()} [!] No valid credentials found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[{ts()}] Loaded {len(creds)} credential(s)")
-    print(f"[{ts()}] Role         : {args.role_name}")
-    print(f"[{ts()}] All regions  : {args.all_regions}")
-    print(f"[{ts()}] Pull secrets : {args.pull_secrets}")
-    print(f"[{ts()}] Fast mode    : {args.fast}")
-    print(f"[{ts()}] Stealth mode : {getattr(args, 'stealth', False)}")
+    # Build evidence-keeping output dir: <key_id>_<YYYYMMDD>/
+    if args.out_dir is None:
+        key_prefix = creds[0][0] if len(creds) == 1 else "multi"
+        datestr = datetime.now(timezone.utc).strftime("%Y%m%d")
+        args.out_dir = os.path.join(os.getcwd(), f"{key_prefix}_{datestr}")
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    print(f"  Credentials : {len(creds)}")
+    print(f"  Region      : {args.region}")
+    print(f"  Role        : {args.role_name}")
+    print(f"  All regions : {args.all_regions}")
+    print(f"  Pull secrets: {args.pull_secrets}")
+    print(f"  Fast mode   : {args.fast}")
+    print(f"  Stealth     : {getattr(args, 'stealth', False)}")
+    print(f"  Output      : {args.out_dir}")
+    print(f"  Started     : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print()
 
     all_results = []
     tested = set()
@@ -1983,17 +1990,17 @@ if __name__ == "__main__":
         while True:
             remaining = [(i, c) for i, c in enumerate(creds) if i not in tested]
             if not remaining:
-                print(f"\n[{ts()}] All credentials have been tested.")
+                print(f"\n{ts()} All credentials have been tested.")
                 break
 
             display_creds = [c for _, c in remaining]
             display_idx_map = [i for i, _ in remaining]
 
-            print(f"\n[{ts()}] {len(remaining)} credential(s) remaining untested")
+            print(f"\n{ts()} {len(remaining)} credential(s) remaining untested")
             choice = choose_credential(display_creds)
 
             if choice is None:
-                print(f"[{ts()}] Exiting.")
+                print(f"{ts()} Exiting.")
                 break
 
             actual_idx = display_idx_map[choice]
@@ -2005,16 +2012,16 @@ if __name__ == "__main__":
 
             remaining_after = [i for i, _ in enumerate(creds) if i not in tested]
             if remaining_after:
-                print(f"\n[{ts()}] {len(remaining_after)} credential(s) still untested.")
+                print(f"\n{ts()} {len(remaining_after)} credential(s) still untested.")
                 try:
                     cont = input(f"  Continue with another? [Y/n]: ").strip().lower()
                     if cont in ("n", "no", "q", "quit", "exit"):
-                        print(f"[{ts()}] Done.")
+                        print(f"{ts()} Done.")
                         break
                 except (EOFError, KeyboardInterrupt):
                     break
             else:
-                print(f"\n[{ts()}] All credentials tested.")
+                print(f"\n{ts()} All credentials tested.")
                 break
 
     if all_results:
@@ -2030,4 +2037,4 @@ if __name__ == "__main__":
             out_path = os.path.join(args.out_dir, f"{key_id}.json")
         with open(out_path, "w") as f:
             json.dump(r, f, indent=2, default=str)
-        print(f"[{ts()}] ✓ JSON saved to {out_path}")
+        print(f"{ts()} ✓ JSON saved to {out_path}")
