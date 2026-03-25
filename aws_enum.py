@@ -516,7 +516,7 @@ DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-2", "eu-central-1", "ap-so
 
 
 def ts():
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC --")
 
 
 def banner():
