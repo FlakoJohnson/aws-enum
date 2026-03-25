@@ -39,7 +39,7 @@ def jitter(stealth=False, min_s=0.5, max_s=2.5):
     if stealth:
         _time.sleep(random.uniform(min_s, max_s))
 
-DEFAULT_ROLE_NAME = "atmos-bootstrap-role"
+DEFAULT_ROLE_NAME = ""
 
 PRIV_CHECKS = [
     # IAM
@@ -602,7 +602,7 @@ Examples:
     assume.add_argument("--no-assume", action="store_true",
                         help="Skip role assumption entirely")
     assume.add_argument("--role-name", default=DEFAULT_ROLE_NAME,
-                        help=f"Role name to attempt assumption (default: {DEFAULT_ROLE_NAME})")
+                        help="Role name to attempt assumption (required for role assumption)")
     assume.add_argument("--accounts",
                         help="Comma-separated account IDs (or ID:alias) to try role assumption in. "
                              "Always includes own account. "
@@ -1461,7 +1461,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   ⚠ ROOT ACCOUNT", flush=True)
 
     # [1b] Role assumption + privilege comparison — pick best credential
-    if not args.no_assume:
+    if not args.no_assume and args.role_name:
         print(f"{ts()} [1b] Checking if assumed role has higher privilege...", flush=True)
         e_key, e_secret, e_token, e_label, e_arn, all_candidates = pick_best_credential(
             key_id, secret, token,
@@ -1491,7 +1491,8 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         else:
             print(f"{ts()}   ✓ Base credential is most privileged — continuing", flush=True)
     else:
-        print(f"{ts()} [1b] Skipping role comparison (--no-assume)", flush=True)
+        reason = "--no-assume" if args.no_assume else "no --role-name specified"
+        print(f"{ts()} [1b] Skipping role comparison ({reason})", flush=True)
         result["credential_used"] = {"key_id": key_id, "label": "base", "arn": identity["arn"]}
 
     # [2] IAM
@@ -1772,7 +1773,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   ✗ {org['error']}", flush=True)
 
     # [14] Full role assumption — try all accounts (org-discovered + user-provided + own)
-    if not args.no_assume:
+    if not args.no_assume and args.role_name:
         stealth_mode = getattr(args, "stealth", False)
         print(f"{ts()} [14] Full role assumption "
               f"{'(own account only — stealth mode)' if stealth_mode else 'across all known accounts'}...",
@@ -1834,7 +1835,8 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         else:
             print(f"{ts()}   All attempts denied", flush=True)
     else:
-        print(f"{ts()} [14] Skipping role assumption (--no-assume)", flush=True)
+        reason = "--no-assume" if args.no_assume else "no --role-name specified"
+        print(f"{ts()} [14] Skipping role assumption ({reason})", flush=True)
         result["role_assumption"] = {}
 
     return result
