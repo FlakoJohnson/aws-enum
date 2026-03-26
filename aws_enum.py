@@ -2026,7 +2026,7 @@ if __name__ == "__main__":
     # Build evidence-keeping output dir: <key_id>_<YYYYMMDD>/
     if args.out_dir is None:
         key_prefix = creds[0][0] if len(creds) == 1 else "multi"
-        datestr = datetime.now(timezone.utc).strftime("%Y%m%d")
+        datestr = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         args.out_dir = os.path.join(os.getcwd(), f"{key_prefix}_{datestr}")
     os.makedirs(args.out_dir, exist_ok=True)
 
