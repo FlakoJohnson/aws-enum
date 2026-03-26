@@ -935,13 +935,11 @@ def check_ssm(key_id, secret, token, region, timeout,
                 ptype = param_types.get(name, "")
                 f.write(f"[{ptype:14s}] {name}\n")
         result["params_file"] = names_file
-        print(f"    {ts()}   SSM names saved → {names_file}", flush=True)
 
     # Optionally pull values
     if pull_secrets and param_names:
         values_file = os.path.join(out_dir, f"ssm_secrets_{account_id}_{region}.txt")
         readable = {}
-        print(f"    {ts()}   Pulling {len(param_names)} SSM values...", flush=True)
         for name in param_names:
             val, _ = safe(client.get_parameter, Name=name, WithDecryption=True)
             if val:
@@ -957,7 +955,6 @@ def check_ssm(key_id, secret, token, region, timeout,
                 f.write(f"[{data['type']:14s}] {name}\n  VALUE: {data['value']}\n\n")
         result["secrets_file"] = values_file
         result["readable_count"] = len(readable)
-        print(f"    {ts()}   SSM values ({len(readable)} readable) → {values_file}", flush=True)
 
     # Test GetParameter access
     if param_names:
@@ -1020,7 +1017,6 @@ def check_secrets_manager(key_id, secret, token, region, timeout,
                     f.write(f"  Description  : {s['Description']}\n")
                 f.write(f"  Last changed : {s.get('LastChangedDate','N/A')}\n\n")
         result["names_file"] = names_file
-        print(f"    {ts()}   SM names saved → {names_file}", flush=True)
 
     if pull_secrets and secret_names:
         values_file = os.path.join(out_dir, f"sm_secrets_{account_id}_{region}.txt")
