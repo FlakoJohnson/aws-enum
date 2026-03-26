@@ -616,6 +616,8 @@ Examples:
     secrets.add_argument("--pull-secrets", action="store_true",
                          help="Pull actual secret values from SSM and Secrets Manager "
                               "(default: list names only, no values)")
+    secrets.add_argument("--pull-secrets-only", action="store_true",
+                         help="Skip all enumeration — only pull SSM params and SM secrets across all regions")
 
     out = parser.add_argument_group("Output")
     out.add_argument("-o", "--output",
@@ -1455,6 +1457,44 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   ✓ Account : {account_id} ({identity.get('account_alias') or 'no alias'})", flush=True)
     print(f"{ts()}   ✓ UserID  : {identity['user_id']}", flush=True)
     print(f"{ts()}   ✓ Type    : {identity['key_type']}", flush=True)
+
+    # ── Pull secrets only mode — skip all other enumeration ──────────
+    if getattr(args, 'pull_secrets_only', False):
+        print(f"{ts()} [*] Pull-secrets-only mode — skipping enumeration", flush=True)
+        result["ssm"] = {}
+        result["secrets_manager"] = {}
+        ssm_total_params = 0
+        sm_total = 0
+        for r in regions:
+            print(f"{ts()}   → {r}...", flush=True)
+            ssm = check_ssm(key_id, secret, token, r, timeout,
+                            pull_secrets=True, out_dir=out_dir,
+                            account_id=f"{account_id}",
+                            stealth=getattr(args, "stealth", False))
+            result["ssm"][r] = ssm
+            param_count = ssm.get("parameter_count", 0)
+            ssm_total_params += param_count
+            if param_count > 0:
+                print(f"{ts()}     SSM: {param_count} params ({ssm.get('secure_string_count',0)} SecureString)", flush=True)
+                if ssm.get("params_file"):
+                    print(f"{ts()}     Names  → {ssm['params_file']}", flush=True)
+                if ssm.get("secrets_file"):
+                    print(f"{ts()}     Values → {ssm['secrets_file']} ({ssm.get('readable_count',0)} readable)", flush=True)
+
+            sm = check_secrets_manager(key_id, secret, token, r, timeout,
+                                        pull_secrets=True, out_dir=out_dir,
+                                        account_id=f"{account_id}")
+            result["secrets_manager"][r] = sm
+            if "error" not in sm and sm.get("total", 0) > 0:
+                sm_total += sm["total"]
+                print(f"{ts()}     SM: {sm['total']} secrets", flush=True)
+                if sm.get("names_file"):
+                    print(f"{ts()}     Names  → {sm['names_file']}", flush=True)
+                if sm.get("values_file"):
+                    print(f"{ts()}     Values → {sm['values_file']} ({sm.get('readable_count',0)} readable)", flush=True)
+
+        print(f"{ts()} [+] Total: {ssm_total_params} SSM params, {sm_total} SM secrets", flush=True)
+        return result
     if identity.get("is_root"):
         print(f"{ts()}   ⚠ ROOT ACCOUNT", flush=True)
 
