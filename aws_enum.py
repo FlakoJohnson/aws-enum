@@ -582,6 +582,8 @@ Examples:
                      help="Single credential: KEY_ID:SECRET or KEY_ID:SECRET:TOKEN")
     inp.add_argument("-f", "--file",
                      help="File with credentials, one per line (KEY:SECRET[:TOKEN])")
+    inp.add_argument("-a", "--all", action="store_true",
+                     help="Run all credentials from file without interactive selection")
 
     opts = parser.add_argument_group("Options")
     opts.add_argument("-r", "--region", default="us-east-1",
@@ -2006,11 +2008,17 @@ if __name__ == "__main__":
     all_results = []
     tested = set()
 
-    # If single credential via -c, skip menu
+    # If single credential via -c, or -a flag, run all without menu
     if args.cred and not args.file:
         key_id, secret, token = creds[0]
         result = enumerate_credential(key_id, secret, token, args, extra_accounts)
         all_results.append(result)
+    elif getattr(args, 'all', False):
+        # Run all credentials sequentially, no menu
+        for i, (key_id, secret, token) in enumerate(creds, 1):
+            print(f"\n{ts()} [{i}/{len(creds)}] {key_id}", flush=True)
+            result = enumerate_credential(key_id, secret, token, args, extra_accounts)
+            all_results.append(result)
     else:
         # Interactive selection loop
         while True:
