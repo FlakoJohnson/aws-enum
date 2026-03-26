@@ -1889,6 +1889,18 @@ def print_summary(all_results, out_dir=None):
         out(f"  │  SM secrets   : {sm_total}")
         out(f"  │  RDS          : {rds_total}")
         out(f"  │  Lambda       : {lam_total}")
+        # RCE indicators
+        rce_regions = []
+        for region, ssm_data in r.get("ssm", {}).items():
+            if isinstance(ssm_data, dict):
+                sc = ssm_data.get("send_command_access", "")
+                if "ALLOWED" in str(sc):
+                    inst_count = ssm_data.get("managed_instances_count", 0)
+                    rce_regions.append(f"{region} ({inst_count} instances)")
+        if rce_regions:
+            out(f"  │  ⚠ RCE       : SSM SendCommand ALLOWED in {', '.join(rce_regions)}")
+        if ssm_inst > 0 and not rce_regions:
+            out(f"  │  SSM targets  : {ssm_inst} managed instances (SendCommand not tested or denied)")
         if assumed:
             out(f"  │  Role assumed : ⚠ {assumed} account(s)")
         if hv:
