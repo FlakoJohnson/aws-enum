@@ -1844,17 +1844,22 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
-def print_summary(all_results):
-    print(f"\n{'═'*60}")
-    print("  SUMMARY")
-    print(f"{'═'*60}")
+def print_summary(all_results, out_dir=None):
+    lines = []
+    def out(msg=""):
+        print(msg)
+        lines.append(msg)
+
+    out(f"\n{'═'*60}")
+    out("  SUMMARY")
+    out(f"{'═'*60}")
 
     valid = [r for r in all_results if r.get("status") == "VALID"]
     invalid = [r for r in all_results if r.get("status") == "INVALID"]
 
-    print(f"  Total   : {len(all_results)}")
-    print(f"  Valid   : {len(valid)}")
-    print(f"  Invalid : {len(invalid)}")
+    out(f"  Total   : {len(all_results)}")
+    out(f"  Valid   : {len(valid)}")
+    out(f"  Invalid : {len(invalid)}")
 
     for r in valid:
         ident = r.get("identity", {})
@@ -1864,42 +1869,49 @@ def print_summary(all_results):
                       if v.get("status") == "SUCCESS")
         hv = r.get("privs", {}).get("high_value", [])
 
-        print(f"\n  ┌─ {r['key_id']}")
+        out(f"\n  ┌─ {r['key_id']}")
         alias = ident.get('account_alias')
         acct_str = f"{ident.get('account','N/A')} ({alias})" if alias else ident.get('account','N/A')
-        print(f"  │  ARN          : {ident.get('arn','N/A')}")
-        print(f"  │  Account      : {acct_str}")
+        out(f"  │  ARN          : {ident.get('arn','N/A')}")
+        out(f"  │  Account      : {acct_str}")
         ec2_inst = sum(v.get("running_count",0) for v in r.get("ec2",{}).values() if isinstance(v, dict))
-        print(f"  │  EC2 instances: {ec2_inst}")
-        print(f"  │  S3 buckets   : {r.get('s3',{}).get('total',0)}")
-        print(f"  │  EKS clusters : {eks_count}")
+        out(f"  │  EC2 instances: {ec2_inst}")
+        out(f"  │  S3 buckets   : {r.get('s3',{}).get('total',0)}")
+        out(f"  │  EKS clusters : {eks_count}")
         ecr_total = sum(v.get("total",0) for v in r.get("ecr",{}).values() if isinstance(v, dict))
         ssm_total = sum(v.get("parameter_count",0) for v in r.get("ssm",{}).values() if isinstance(v, dict))
         sm_total  = sum(v.get("total",0) for v in r.get("secrets_manager",{}).values() if isinstance(v, dict))
         rds_total = sum(len(v.get("instances",[])) for v in r.get("rds",{}).values() if isinstance(v, dict))
         lam_total = sum(v.get("total",0) for v in r.get("lambda",{}).values() if isinstance(v, dict))
         ssm_inst  = sum(v.get("managed_instances_count",0) for v in r.get("ssm",{}).values() if isinstance(v, dict))
-        print(f"  │  ECR repos    : {ecr_total}")
-        print(f"  │  SSM params   : {ssm_total} ({ssm_inst} managed instances)")
-        print(f"  │  SM secrets   : {sm_total}")
-        print(f"  │  RDS          : {rds_total}")
-        print(f"  │  Lambda       : {lam_total}")
+        out(f"  │  ECR repos    : {ecr_total}")
+        out(f"  │  SSM params   : {ssm_total} ({ssm_inst} managed instances)")
+        out(f"  │  SM secrets   : {sm_total}")
+        out(f"  │  RDS          : {rds_total}")
+        out(f"  │  Lambda       : {lam_total}")
         if assumed:
-            print(f"  │  Role assumed : ⚠ {assumed} account(s)")
+            out(f"  │  Role assumed : ⚠ {assumed} account(s)")
         if hv:
-            print(f"  │  High privs  : {', '.join(hv[:3])}{'...' if len(hv)>3 else ''}")
+            out(f"  │  High privs  : {', '.join(hv[:3])}{'...' if len(hv)>3 else ''}")
         privesc = r.get("privesc_paths", [])
         if privesc:
             critical = [p for p in privesc if p["risk"] == "CRITICAL"]
             high = [p for p in privesc if p["risk"] == "HIGH"]
-            print(f"  │  Privesc     : ⚠ {len(privesc)} paths ({len(critical)} critical, {len(high)} high)")
+            out(f"  │  Privesc     : ⚠ {len(privesc)} paths ({len(critical)} critical, {len(high)} high)")
             for p in privesc[:5]:
-                print(f"  │    [{p['risk']}] {p['name']}")
+                out(f"  │    [{p['risk']}] {p['name']}")
             if len(privesc) > 5:
-                print(f"  │    ... and {len(privesc)-5} more")
-        print(f"  └{'─'*50}")
+                out(f"  │    ... and {len(privesc)-5} more")
+        out(f"  └{'─'*50}")
 
-    print(f"{'═'*60}\n")
+    out(f"{'═'*60}\n")
+
+    # Save summary to output dir
+    if out_dir:
+        summary_path = os.path.join(out_dir, "summary.txt")
+        with open(summary_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"{ts()} ✓ Summary saved to {summary_path}")
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
@@ -2027,7 +2039,7 @@ if __name__ == "__main__":
                 break
 
     if all_results:
-        print_summary(all_results)
+        print_summary(all_results, out_dir=args.out_dir)
 
     for r in all_results:
         if r.get("status") != "VALID":
