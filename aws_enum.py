@@ -1543,39 +1543,36 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     if identity.get("is_root"):
         print(f"{ts()}   ⚠ ROOT ACCOUNT", flush=True)
 
-    # [1b] Role assumption + privilege comparison — pick best credential
+    # [1b] Role assumption — assume into target accounts, then enumerate with assumed creds
     if not args.no_assume and args.role_name:
-        print(f"{ts()} [1b] Checking if assumed role has higher privilege...", flush=True)
-        e_key, e_secret, e_token, e_label, e_arn, all_candidates = pick_best_credential(
-            key_id, secret, token,
-            region, timeout,
-            args.role_name,
-            extra_accounts,
-            account_id,
-            args.fast
-        )
-        result["credential_used"] = {
-            "key_id": e_key,
-            "label": e_label,
-            "arn": e_arn,
-            "privilege_comparison": [
-                {"label": c["label"], "allowed": c["allowed"], "arn": c["arn"]}
-                for c in all_candidates
-            ]
-        }
-        # Swap to best credential for all subsequent checks
-        if e_key != key_id:
-            key_id, secret, token = e_key, e_secret, e_token
-            # Re-fetch identity for the assumed role
-            identity, _ = check_identity(key_id, secret, token, region, timeout)
-            account_id = identity["account"] if identity else account_id
-            print(f"{ts()}   ★ Switching to: {e_label}", flush=True)
-            print(f"{ts()}     ARN: {e_arn}", flush=True)
+        # Build target account list: user-provided + org-discovered + own
+        assume_accounts = dict(extra_accounts)
+        if account_id not in assume_accounts:
+            assume_accounts[account_id] = f"account-{account_id}"
+
+        print(f"{ts()} [1b] Assuming {args.role_name} in {len(assume_accounts)} account(s)...", flush=True)
+
+        for acct_id, alias in assume_accounts.items():
+            print(f"{ts()}   Trying {args.role_name} @ {alias} ({acct_id})...", flush=True)
+            creds_tuple = try_assume_role(key_id, secret, token, region, timeout, args.role_name, acct_id)
+            if creds_tuple:
+                ak, sk, st, role_arn = creds_tuple
+                assumed_identity, _ = check_identity(ak, sk, st, region, timeout)
+                key_id, secret, token = ak, sk, st
+                identity = assumed_identity if assumed_identity else identity
+                account_id = identity["account"] if identity else acct_id
+                print(f"{ts()}   ✓ Assumed {role_arn}", flush=True)
+                print(f"{ts()}     ARN: {identity['arn']}", flush=True)
+                result["credential_used"] = {"key_id": ak, "label": f"{args.role_name} @ {alias}", "arn": identity["arn"]}
+                break  # Use first successful assumption
+            else:
+                print(f"{ts()}   ✗ Denied", flush=True)
         else:
-            print(f"{ts()}   ✓ Base credential is most privileged — continuing", flush=True)
+            print(f"{ts()}   All role assumptions denied — continuing with base credential", flush=True)
+            result["credential_used"] = {"key_id": key_id, "label": "base", "arn": identity["arn"]}
     else:
         reason = "--no-assume" if args.no_assume else "no --role-name specified"
-        print(f"{ts()} [1b] Skipping role comparison ({reason})", flush=True)
+        print(f"{ts()} [1b] Skipping role assumption ({reason})", flush=True)
         result["credential_used"] = {"key_id": key_id, "label": "base", "arn": identity["arn"]}
 
     # [2] IAM
@@ -1866,72 +1863,8 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     else:
         print(f"{ts()}   ✗ {org['error']}", flush=True)
 
-    # [14] Full role assumption — try all accounts (org-discovered + user-provided + own)
-    if not args.no_assume and args.role_name:
-        stealth_mode = getattr(args, "stealth", False)
-        print(f"{ts()} [14] Full role assumption "
-              f"{'(own account only — stealth mode)' if stealth_mode else 'across all known accounts'}...",
-              flush=True)
-
-        assume_accounts = {}
-
-        if stealth_mode:
-            # Stealth: only try own account to avoid cross-account CloudTrail noise
-            assume_accounts[account_id] = f"account-{account_id}"
-            print(f"{ts()}   Stealth: limiting to own account only", flush=True)
-        else:
-            assume_accounts = dict(extra_accounts)
-            # Feed in org-discovered accounts
-            if "accounts" in org and org.get("accounts"):
-                for a in org["accounts"]:
-                    if a["id"] not in assume_accounts:
-                        assume_accounts[a["id"]] = a["name"]
-                print(f"{ts()}   {len(org['accounts'])} accounts from Organizations", flush=True)
-            # Always include own account
-            if account_id not in assume_accounts:
-                assume_accounts[account_id] = f"account-{account_id}"
-
-        print(f"{ts()}   Total targets: {len(assume_accounts)} accounts", flush=True)
-
-        assumed = attempt_role_assumption(
-            key_id, secret, token, region, timeout,
-            role_name=args.role_name,
-            accounts=assume_accounts,
-            source_account=account_id,
-            pull_secrets=pull,
-            out_dir=out_dir,
-            regions=regions
-        )
-        result["role_assumption"] = assumed
-
-        successes = {k: v for k, v in assumed.items() if v.get("status") == "SUCCESS"}
-        if successes:
-            print(f"{ts()}   ⚠ ASSUMED {args.role_name} IN {len(successes)} ACCOUNT(S):", flush=True)
-            for aid, data in successes.items():
-                cross = " (cross-account)" if data.get("cross_account") else " (own account)"
-                print(f"{ts()}     → {data['account_alias']} ({aid}){cross}", flush=True)
-                eks_t = sum(len(c) for c in data.get("eks_clusters", {}).values())
-                ec2_t = sum(v.get("running_count", 0) for v in data.get("ec2", {}).values() if isinstance(v, dict))
-                ecr_t = sum(v.get("total", 0) for v in data.get("ecr", {}).values() if isinstance(v, dict))
-                ssm_p = sum(v.get("parameter_count", 0) for v in data.get("ssm", {}).values() if isinstance(v, dict))
-                ssm_i = sum(v.get("managed_instances_count", 0) for v in data.get("ssm", {}).values() if isinstance(v, dict))
-                sm_t = sum(v.get("total", 0) for v in data.get("secrets_manager", {}).values() if isinstance(v, dict))
-                rds_t = sum(len(v.get("instances", [])) for v in data.get("rds", {}).values() if isinstance(v, dict))
-                lam_t = sum(v.get("total", 0) for v in data.get("lambda", {}).values() if isinstance(v, dict))
-                print(f"{ts()}       S3     : {data.get('s3',{}).get('total',0)} buckets", flush=True)
-                print(f"{ts()}       EC2    : {ec2_t} instances", flush=True)
-                print(f"{ts()}       EKS    : {eks_t} clusters", flush=True)
-                print(f"{ts()}       ECR    : {ecr_t} repos", flush=True)
-                print(f"{ts()}       SSM    : {ssm_p} params, {ssm_i} managed instances", flush=True)
-                print(f"{ts()}       SM     : {sm_t} secrets", flush=True)
-                print(f"{ts()}       RDS    : {rds_t} instances", flush=True)
-                print(f"{ts()}       Lambda : {lam_t} functions", flush=True)
-        else:
-            print(f"{ts()}   All attempts denied", flush=True)
-    else:
-        reason = "--no-assume" if args.no_assume else "no --role-name specified"
-        print(f"{ts()} [14] Skipping role assumption ({reason})", flush=True)
-        result["role_assumption"] = {}
+    # Role assumption enumeration is handled in [1b] — creds already swapped if successful.
+    # All steps [2]-[13] above ran with the assumed role creds.
 
     return result
 
