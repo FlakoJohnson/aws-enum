@@ -16,7 +16,7 @@ Input file format (one per line):
     AKIAXXXXXXXXXXXXXXXX:secretkeyhere:optionalsessiontoken
     # Comments and blank lines ignored
 
-Author: FlakoJohnson
+Author: d0s
 """
 
 import boto3
