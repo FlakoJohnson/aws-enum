@@ -2382,8 +2382,8 @@ if __name__ == "__main__":
     all_results = []
     tested = set()
 
-    # If single credential via -c, or -a flag, run all without menu
-    if args.cred and not args.file:
+    # If single credential via -c or --profile, or -a flag, run all without menu
+    if (args.cred or args.profile) and not args.file:
         key_id, secret, token = creds[0]
         result = enumerate_credential(key_id, secret, token, args, extra_accounts)
         all_results.append(result)
