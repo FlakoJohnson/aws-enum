@@ -581,6 +581,8 @@ Examples:
                      help="Single credential: KEY_ID:SECRET or KEY_ID:SECRET:TOKEN")
     inp.add_argument("-f", "--file",
                      help="File with credentials, one per line (KEY:SECRET[:TOKEN])")
+    inp.add_argument("--profile",
+                     help="AWS CLI profile name (reads from ~/.aws/credentials)")
     inp.add_argument("-a", "--all", action="store_true",
                      help="Run all credentials from file without interactive selection")
 
@@ -628,8 +630,8 @@ Examples:
 
     args = parser.parse_args()
 
-    if not args.cred and not args.file:
-        parser.error("Provide --cred or --file")
+    if not args.cred and not args.file and not args.profile:
+        parser.error("Provide --cred, --file, or --profile")
 
     return args
 
@@ -2291,6 +2293,19 @@ def print_summary(all_results, out_dir=None):
 
 def load_credentials(args):
     creds = []
+    if args.profile:
+        # Load creds from AWS CLI profile
+        try:
+            session = boto3.Session(profile_name=args.profile)
+            frozen = session.get_credentials().get_frozen_credentials()
+            key_id = frozen.access_key
+            secret = frozen.secret_key
+            token = frozen.token if frozen.token else None
+            creds.append((key_id, secret, token))
+            print(f"{ts()} Loaded profile '{args.profile}' ({key_id[:12]}...)", flush=True)
+        except Exception as e:
+            print(f"{ts()} [!] Failed to load profile '{args.profile}': {e}", file=sys.stderr)
+            sys.exit(1)
     if args.cred:
         parts = args.cred.strip().split(":", 2)
         if len(parts) >= 2:
