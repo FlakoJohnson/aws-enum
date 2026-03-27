@@ -794,15 +794,61 @@ def check_s3(key_id, secret, token, region, timeout):
     if err:
         return {"error": err}
     names = [b["Name"] for b in result.get("Buckets", [])]
-    return {
+
+    # Categorize by name
+    s3_result = {
         "total": len(names),
         "terraform_buckets": [b for b in names if "terraform" in b.lower()],
         "backup_buckets": [b for b in names if any(kw in b.lower()
                            for kw in ["backup", "velero", "snapshot"])],
         "log_buckets": [b for b in names if any(kw in b.lower()
                         for kw in ["log", "audit", "access"])],
-        "all": names
+        "secret_buckets": [b for b in names if any(kw in b.lower()
+                           for kw in ["secret", "credential", "key", "vault", "password", "token"])],
+        "cicd_buckets": [b for b in names if any(kw in b.lower()
+                         for kw in ["deploy", "artifact", "pipeline", "codebuild", "codepipeline"])],
+        "all": names,
+        "public": [],
+        "policy_writable": [],
+        "versioning_disabled": [],
     }
+
+    # Deeper enumeration per bucket (read-only, stealthy)
+    for bname in names:
+        # Check public access — GetBucketPolicyStatus is a lightweight read-only call
+        pol_status, _ = safe(client.get_bucket_policy_status, Bucket=bname)
+        if pol_status and pol_status.get("PolicyStatus", {}).get("IsPublic"):
+            s3_result["public"].append(bname)
+
+        # Check bucket policy for write access from external principals
+        policy, _ = safe(client.get_bucket_policy, Bucket=bname)
+        if policy:
+            import json as _json
+            try:
+                pol_doc = _json.loads(policy["Policy"])
+                for stmt in pol_doc.get("Statement", []):
+                    principal = stmt.get("Principal", "")
+                    effect = stmt.get("Effect", "")
+                    action = stmt.get("Action", [])
+                    if isinstance(action, str):
+                        action = [action]
+                    if effect == "Allow" and principal in ("*", {"AWS": "*"}):
+                        write_actions = [a for a in action if any(w in a.lower()
+                                         for w in ["put", "delete", "s3:*"])]
+                        if write_actions:
+                            s3_result["policy_writable"].append({
+                                "bucket": bname,
+                                "actions": write_actions,
+                            })
+            except Exception:
+                pass
+
+        # Check versioning — unversioned buckets are easier to tamper
+        ver, _ = safe(client.get_bucket_versioning, Bucket=bname)
+        if ver and ver.get("Status") != "Enabled":
+            s3_result["versioning_disabled"].append(bname)
+
+    return s3_result
 
 
 def check_ec2(key_id, secret, token, region, timeout):
@@ -1629,6 +1675,17 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   Terraform : {len(s3.get('terraform_buckets',[]))} buckets", flush=True)
         print(f"{ts()}   Backup    : {len(s3.get('backup_buckets',[]))} buckets", flush=True)
         print(f"{ts()}   Logs      : {len(s3.get('log_buckets',[]))} buckets", flush=True)
+        print(f"{ts()}   Secrets   : {len(s3.get('secret_buckets',[]))} buckets", flush=True)
+        print(f"{ts()}   CI/CD     : {len(s3.get('cicd_buckets',[]))} buckets", flush=True)
+        if s3.get("public"):
+            print(f"{ts()}   ⚠ PUBLIC  : {len(s3['public'])} buckets — {', '.join(s3['public'][:5])}", flush=True)
+        if s3.get("policy_writable"):
+            print(f"{ts()}   ⚠ WRITABLE: {len(s3['policy_writable'])} buckets with public write policy", flush=True)
+            for pw in s3["policy_writable"][:5]:
+                print(f"{ts()}     {pw['bucket']} — {', '.join(pw['actions'])}", flush=True)
+        no_ver = s3.get("versioning_disabled", [])
+        if no_ver:
+            print(f"{ts()}   No versioning: {len(no_ver)}/{s3['total']} buckets", flush=True)
     else:
         print(f"{ts()}   ✗ {s3['error']}", flush=True)
 
