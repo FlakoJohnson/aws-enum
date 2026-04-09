@@ -1809,8 +1809,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   ✓ Account : {account_id} ({identity.get('account_alias') or 'no alias'})", flush=True)
     print(f"{ts()}   ✓ UserID  : {identity['user_id']}", flush=True)
     print(f"{ts()}   ✓ Type    : {identity['key_type']}", flush=True)
-    if partition != "aws":
-        print(f"{ts()}   ✓ Partition: {partition} ({', '.join(regions)})", flush=True)
+    print(f"{ts()}   ✓ Region  : {region} ({', '.join(regions)})" + (f" [{partition}]" if partition != "aws" else ""), flush=True)
 
     # ── Pull secrets only mode — skip all other enumeration ──────────
     if getattr(args, 'pull_secrets_only', False):
@@ -2418,8 +2417,7 @@ if __name__ == "__main__":
     os.makedirs(args.out_dir, exist_ok=True)
 
     print(f"  Credentials : {len(creds)}")
-    print(f"  Region      : {args.region}")
-    print(f"  Role        : {args.role_name}")
+    print(f"  Role        : {args.role_name or '(none)'}")
     print(f"  All regions : {args.all_regions}")
     print(f"  Pull secrets: {args.pull_secrets}")
     print(f"  Fast mode   : {args.fast}")
