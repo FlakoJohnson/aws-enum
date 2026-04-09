@@ -641,6 +641,15 @@ Examples:
     assume.add_argument("--accounts-file",
                         help="File with account IDs, one per line (ID or ID:alias)")
 
+    org = parser.add_argument_group("Organization Enumeration")
+    org.add_argument("--org-enum", action="store_true",
+                     help="Enumerate all accounts in the organization. "
+                          "Lists accounts via Organizations API, then assumes "
+                          "OrganizationAccountAccessRole (or --role-name) into each "
+                          "child account and runs full enumeration.")
+    org.add_argument("--org-role", default="OrganizationAccountAccessRole",
+                     help="Role to assume in each org account (default: OrganizationAccountAccessRole)")
+
     secrets = parser.add_argument_group("Secrets")
     secrets.add_argument("--pull-secrets", action="store_true",
                          help="Pull actual secret values from SSM and Secrets Manager "
@@ -2482,6 +2491,74 @@ if __name__ == "__main__":
             else:
                 print(f"\n{ts()} All credentials tested.")
                 break
+
+    # ── Org-wide enumeration ────────────────────────────────────────────
+    if getattr(args, "org_enum", False) and all_results:
+        base = all_results[0]
+        if base.get("status") == "VALID":
+            org_data = base.get("organizations", {})
+            org_accounts = org_data.get("accounts", [])
+            partition = base.get("partition", "aws")
+            base_account = base.get("identity", {}).get("account", "")
+            org_role = args.org_role
+
+            if not org_accounts:
+                print(f"\n{ts()} [org-enum] No accounts discovered — ListAccounts may have failed")
+            else:
+                active = [a for a in org_accounts if a["status"] == "ACTIVE" and a["id"] != base_account]
+                print(f"\n{'═'*60}")
+                print(f"  ORG ENUMERATION — {len(active)} child accounts")
+                print(f"  Role: {org_role}")
+                print(f"{'═'*60}")
+
+                # Use base credential for assuming into child accounts
+                base_key = creds[0][0]
+                base_secret = creds[0][1]
+                base_token = creds[0][2] if len(creds[0]) > 2 else None
+                base_region = base.get("partition", "aws")
+                region = "cn-northwest-1" if partition == "aws-cn" else "us-east-1"
+
+                for i, acct in enumerate(active, 1):
+                    acct_id = acct["id"]
+                    acct_name = acct.get("name", acct_id)
+                    print(f"\n{ts()} [{i}/{len(active)}] {acct_name} ({acct_id})")
+                    print(f"{ts()}   Assuming {org_role}...", flush=True)
+
+                    creds_tuple = try_assume_role(
+                        base_key, base_secret, base_token,
+                        region, args.timeout, org_role, acct_id, partition
+                    )
+                    if not creds_tuple:
+                        print(f"{ts()}   ✗ Denied — skipping")
+                        all_results.append({
+                            "key_id": f"{org_role}@{acct_id}",
+                            "status": "DENIED",
+                            "account": acct_id,
+                            "account_name": acct_name,
+                        })
+                        continue
+
+                    ak, sk, st, role_arn = creds_tuple
+                    print(f"{ts()}   ✓ Assumed {role_arn}", flush=True)
+
+                    # Create sub-output dir per account
+                    acct_dir = os.path.join(args.out_dir, f"org_{acct_id}")
+                    os.makedirs(acct_dir, exist_ok=True)
+                    saved_out_dir = args.out_dir
+                    args.out_dir = acct_dir
+
+                    # Temporarily disable org-enum to prevent recursion
+                    args.org_enum = False
+                    args.no_assume = True
+                    result = enumerate_credential(ak, sk, st, args, {})
+                    result["org_account_id"] = acct_id
+                    result["org_account_name"] = acct_name
+                    all_results.append(result)
+                    args.out_dir = saved_out_dir
+                    args.org_enum = True
+                    args.no_assume = False
+
+                print(f"\n{ts()} [org-enum] Complete — {len(active)} accounts processed")
 
     if all_results:
         print_summary(all_results, out_dir=args.out_dir)
