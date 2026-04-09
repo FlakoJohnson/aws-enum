@@ -802,9 +802,13 @@ def check_privs(key_id, secret, token, region, timeout, identity):
     if identity.get("is_root"):
         return {"note": "Root — all actions allowed"}
     client = make_client("iam", key_id, secret, token, region, timeout)
+    # Convert session ARN to role ARN for simulate_principal_policy
+    source_arn = identity["arn"]
+    if identity.get("is_role"):
+        source_arn = session_arn_to_role_arn(source_arn)
     result, err = safe(
         client.simulate_principal_policy,
-        PolicySourceArn=identity["arn"],
+        PolicySourceArn=source_arn,
         ActionNames=PRIV_CHECKS
     )
     if err:
