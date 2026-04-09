@@ -724,10 +724,18 @@ def check_identity(key_id, secret, token, region, timeout):
     client = make_client("sts", key_id, secret, token, region, timeout)
     result, err = safe(client.get_caller_identity)
     if err:
-        return None, err
+        # China keys fail against standard endpoints — retry cn-northwest-1
+        if err in ("InvalidClientTokenId", "SignatureDoesNotMatch") and not region.startswith("cn-"):
+            client = make_client("sts", key_id, secret, token, "cn-northwest-1", timeout)
+            result, err = safe(client.get_caller_identity)
+            if err:
+                return None, err
+        else:
+            return None, err
 
-    # Get account alias
-    iam = make_client("iam", key_id, secret, token, region, timeout)
+    # Get account alias — use cn-northwest-1 for China ARNs
+    iam_region = "cn-northwest-1" if ":aws-cn:" in result["Arn"] else region
+    iam = make_client("iam", key_id, secret, token, iam_region, timeout)
     aliases, _ = safe(iam.list_account_aliases)
     alias = aliases["AccountAliases"][0] if aliases and aliases.get("AccountAliases") else None
 
