@@ -514,6 +514,34 @@ ALL_REGIONS = [
 
 DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-2", "eu-central-1", "ap-southeast-1"]
 
+# AWS China partition
+CN_ALL_REGIONS = ["cn-north-1", "cn-northwest-1"]
+CN_DEFAULT_REGIONS = ["cn-north-1", "cn-northwest-1"]
+
+
+def detect_partition(arn):
+    """Detect AWS partition from ARN. Returns 'aws-cn' for China, 'aws' otherwise."""
+    if arn and ":aws-cn:" in arn:
+        return "aws-cn"
+    return "aws"
+
+
+def arn_prefix(partition):
+    """Return ARN prefix for partition."""
+    return f"arn:{partition}"
+
+
+def regions_for_partition(partition, all_regions=False):
+    """Return region lists appropriate for the partition."""
+    if partition == "aws-cn":
+        return CN_ALL_REGIONS if all_regions else CN_DEFAULT_REGIONS
+    return ALL_REGIONS if all_regions else DEFAULT_REGIONS
+
+
+def org_region(partition):
+    """Organizations API endpoint region per partition."""
+    return "cn-northwest-1" if partition == "aws-cn" else "us-east-1"
+
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC --")
@@ -1087,9 +1115,9 @@ def check_secrets_manager(key_id, secret, token, region, timeout,
     return result
 
 
-def check_org(key_id, secret, token, region, timeout):
-    # Organizations API must target us-east-1 regardless of primary region
-    client = make_client("organizations", key_id, secret, token, "us-east-1", timeout)
+def check_org(key_id, secret, token, region, timeout, partition="aws"):
+    # Organizations API must target us-east-1 (or cn-northwest-1 for China)
+    client = make_client("organizations", key_id, secret, token, org_region(partition), timeout)
     org, err = safe(client.describe_organization)
     if err:
         return {"error": err}
@@ -1443,10 +1471,10 @@ def generate_loot(result, out_dir, account_id):
     return loot_path
 
 
-def try_assume_role(key_id, secret, token, region, timeout, role_name, account_id):
+def try_assume_role(key_id, secret, token, region, timeout, role_name, account_id, partition="aws"):
     """Try to assume a single role, return credentials tuple or None"""
     sts = make_client("sts", key_id, secret, token, region, timeout)
-    role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+    role_arn = f"arn:{partition}:iam::{account_id}:role/{role_name}"
     assumed, err = safe(sts.assume_role, RoleArn=role_arn,
                         RoleSessionName="aws", DurationSeconds=3600)
     if assumed:
@@ -1465,18 +1493,18 @@ def count_allowed(privs):
 def session_arn_to_role_arn(arn):
     """
     Convert assumed-role session ARN to role ARN for simulate_principal_policy.
-    arn:aws:sts::ACCT:assumed-role/ROLE/SESSION → arn:aws:iam::ACCT:role/ROLE
+    arn:aws(-cn):sts::ACCT:assumed-role/ROLE/SESSION → arn:aws(-cn):iam::ACCT:role/ROLE
     """
     import re
-    m = re.match(r"arn:aws:sts::(\d+):assumed-role/([^/]+)/", arn)
+    m = re.match(r"arn:(aws[\w-]*):sts::(\d+):assumed-role/([^/]+)/", arn)
     if m:
-        return f"arn:aws:iam::{m.group(1)}:role/{m.group(2)}"
+        return f"arn:{m.group(1)}:iam::{m.group(2)}:role/{m.group(3)}"
     return arn
 
 
 def pick_best_credential(base_key, base_secret, base_token,
                           region, timeout, role_name,
-                          extra_accounts, source_account, fast):
+                          extra_accounts, source_account, fast, partition="aws"):
     """
     Try to assume role_name in own account + extra_accounts.
     Run privilege simulation on base cred and each successful assumption.
@@ -1511,7 +1539,7 @@ def pick_best_credential(base_key, base_secret, base_token,
     for acct_id, alias in all_accounts.items():
         print(f"  {ts()}   Trying {role_name} @ {alias} ({acct_id})...", flush=True)
         creds = try_assume_role(base_key, base_secret, base_token,
-                                region, timeout, role_name, acct_id)
+                                region, timeout, role_name, acct_id, partition)
         if not creds:
             print(f"  {ts()}     ✗ Denied", flush=True)
             continue
@@ -1572,10 +1600,10 @@ def pick_best_credential(base_key, base_secret, base_token,
 
 def attempt_role_assumption(key_id, secret, token, region, timeout,
                              role_name, accounts, source_account,
-                             pull_secrets, out_dir, regions=None):
+                             pull_secrets, out_dir, regions=None, partition="aws"):
     sts = make_client("sts", key_id, secret, token, region, timeout)
     results = {}
-    regions = regions or DEFAULT_REGIONS
+    regions = regions or regions_for_partition(partition)
 
     all_accounts = dict(accounts)
     if source_account and source_account not in all_accounts:
@@ -1584,7 +1612,7 @@ def attempt_role_assumption(key_id, secret, token, region, timeout,
     print(f"    {ts()} Testing {role_name} in {len(all_accounts)} account(s) across {len(regions)} regions...", flush=True)
 
     for account_id, alias in all_accounts.items():
-        role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+        role_arn = f"arn:{partition}:iam::{account_id}:role/{role_name}"
         cross = "(cross)" if account_id != source_account else "(own)"
         print(f"    {ts()}   {alias} ({account_id}) {cross}...", flush=True)
 
@@ -1760,10 +1788,21 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     result["status"] = "VALID"
     result["identity"] = identity
     account_id = identity["account"]
+    partition = detect_partition(identity["arn"])
+    result["partition"] = partition
+
+    # Override regions for AWS China
+    if partition == "aws-cn":
+        regions = regions_for_partition(partition, args.all_regions)
+        if region == "us-east-1":  # default wasn't overridden by user
+            region = "cn-northwest-1"
+
     print(f"{ts()}   ✓ ARN     : {identity['arn']}", flush=True)
     print(f"{ts()}   ✓ Account : {account_id} ({identity.get('account_alias') or 'no alias'})", flush=True)
     print(f"{ts()}   ✓ UserID  : {identity['user_id']}", flush=True)
     print(f"{ts()}   ✓ Type    : {identity['key_type']}", flush=True)
+    if partition != "aws":
+        print(f"{ts()}   ✓ Partition: {partition} ({', '.join(regions)})", flush=True)
 
     # ── Pull secrets only mode — skip all other enumeration ──────────
     if getattr(args, 'pull_secrets_only', False):
@@ -1807,16 +1846,18 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
     # [1b] Role assumption — assume into target accounts, then enumerate with assumed creds
     if not args.no_assume and args.role_name:
-        # Build target account list: user-provided + org-discovered + own
-        assume_accounts = dict(extra_accounts)
-        if account_id not in assume_accounts:
-            assume_accounts[account_id] = f"account-{account_id}"
+        # If user explicitly specified accounts, only try those.
+        # Otherwise fall back to own account.
+        if extra_accounts:
+            assume_accounts = dict(extra_accounts)
+        else:
+            assume_accounts = {account_id: f"account-{account_id}"}
 
         print(f"{ts()} [1b] Assuming {args.role_name} in {len(assume_accounts)} account(s)...", flush=True)
 
         for acct_id, alias in assume_accounts.items():
             print(f"{ts()}   Trying {args.role_name} @ {alias} ({acct_id})...", flush=True)
-            creds_tuple = try_assume_role(key_id, secret, token, region, timeout, args.role_name, acct_id)
+            creds_tuple = try_assume_role(key_id, secret, token, region, timeout, args.role_name, acct_id, partition)
             if creds_tuple:
                 ak, sk, st, role_arn = creds_tuple
                 assumed_identity, _ = check_identity(ak, sk, st, region, timeout)
@@ -2108,7 +2149,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
     # [13] Organizations
     print(f"{ts()} [13] Organizations...", flush=True)
-    org = check_org(key_id, secret, token, region, timeout)
+    org = check_org(key_id, secret, token, region, timeout, partition)
     result["organizations"] = org
     if "error" not in org:
         print(f"{ts()}   Org ID        : {org.get('org_id')}", flush=True)
