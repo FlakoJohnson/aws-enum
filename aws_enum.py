@@ -2505,21 +2505,26 @@ if __name__ == "__main__":
             if not org_accounts:
                 print(f"\n{ts()} [org-enum] No accounts discovered — ListAccounts may have failed")
             else:
-                active = [a for a in org_accounts if a["status"] == "ACTIVE" and a["id"] != base_account]
+                active = [a for a in org_accounts if a.get("status") == "ACTIVE" and a.get("id") != base_account]
                 print(f"\n{'═'*60}")
                 print(f"  ORG ENUMERATION — {len(active)} child accounts")
                 print(f"  Role: {org_role}")
                 print(f"{'═'*60}")
 
-                # Use base credential for assuming into child accounts
-                base_key = creds[0][0]
-                base_secret = creds[0][1]
-                base_token = creds[0][2] if len(creds[0]) > 2 else None
-                base_region = base.get("partition", "aws")
+                # Use the credential that produced the base result
+                base_key_id = base.get("key_id", "")
+                base_cred = next((c for c in creds if c[0] == base_key_id), creds[0])
+                base_key, base_secret = base_cred[0], base_cred[1]
+                base_token = base_cred[2] if len(base_cred) > 2 else None
                 region = "cn-northwest-1" if partition == "aws-cn" else "us-east-1"
 
+                # Save original args state
+                saved_out_dir = args.out_dir
+                saved_org_enum = args.org_enum
+                saved_no_assume = args.no_assume
+
                 for i, acct in enumerate(active, 1):
-                    acct_id = acct["id"]
+                    acct_id = acct.get("id", "unknown")
                     acct_name = acct.get("name", acct_id)
                     print(f"\n{ts()} [{i}/{len(active)}] {acct_name} ({acct_id})")
                     print(f"{ts()}   Assuming {org_role}...", flush=True)
@@ -2542,21 +2547,31 @@ if __name__ == "__main__":
                     print(f"{ts()}   ✓ Assumed {role_arn}", flush=True)
 
                     # Create sub-output dir per account
-                    acct_dir = os.path.join(args.out_dir, f"org_{acct_id}")
+                    acct_dir = os.path.join(saved_out_dir, f"org_{acct_id}")
                     os.makedirs(acct_dir, exist_ok=True)
-                    saved_out_dir = args.out_dir
-                    args.out_dir = acct_dir
 
-                    # Temporarily disable org-enum to prevent recursion
-                    args.org_enum = False
-                    args.no_assume = True
-                    result = enumerate_credential(ak, sk, st, args, {})
-                    result["org_account_id"] = acct_id
-                    result["org_account_name"] = acct_name
-                    all_results.append(result)
-                    args.out_dir = saved_out_dir
-                    args.org_enum = True
-                    args.no_assume = False
+                    try:
+                        # Temporarily override args for child enumeration
+                        args.out_dir = acct_dir
+                        args.org_enum = False
+                        args.no_assume = True
+                        result = enumerate_credential(ak, sk, st, args, {})
+                        result["org_account_id"] = acct_id
+                        result["org_account_name"] = acct_name
+                        all_results.append(result)
+                    except Exception as e:
+                        print(f"{ts()}   ✗ Error enumerating {acct_id}: {e}")
+                        all_results.append({
+                            "key_id": f"{org_role}@{acct_id}",
+                            "status": "ERROR",
+                            "account": acct_id,
+                            "account_name": acct_name,
+                            "error": str(e),
+                        })
+                    finally:
+                        args.out_dir = saved_out_dir
+                        args.org_enum = saved_org_enum
+                        args.no_assume = saved_no_assume
 
                 print(f"\n{ts()} [org-enum] Complete — {len(active)} accounts processed")
 
