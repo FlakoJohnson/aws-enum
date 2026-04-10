@@ -8,10 +8,10 @@ Red team AWS credential enumerator. Given AWS access key pairs, performs full id
 
 | Check | Details |
 |---|---|
-| **STS Identity** | ARN, account ID, alias, key type (AKIA/ASIA), root detection |
+| **STS Identity** | ARN, account ID, alias, key type (AKIA/ASIA), root detection, AWS China auto-detection |
 | **IAM User** | Username, groups, policies (attached + inline), access keys, creation date |
 | **IAM Visibility** | Visible users, visible roles across the account |
-| **Privilege Simulation** | 60+ IAM actions tested via `SimulatePrincipalPolicy`, high-value permissions flagged |
+| **Privilege Simulation** | 60+ IAM actions tested via `SimulatePrincipalPolicy`, high-value permissions flagged. Auto-converts session ARNs to role ARNs for assumed roles |
 
 ### Resources (multi-region)
 
@@ -24,16 +24,33 @@ Red team AWS credential enumerator. Given AWS access key pairs, performs full id
 | **SSM** | Managed instances (RCE targets), parameters (with SecureString count), SendCommand access test |
 | **Secrets Manager** | Secret names and metadata, optional value extraction |
 | **RDS** | DB instances and clusters, engine, endpoint, public accessibility |
-| **Lambda** | Functions with runtime and execution role |
+| **Lambda** | Functions with runtime and execution role, environment variable extraction |
+| **ECS** | Task definition environment variable extraction |
 | **CloudWatch Logs** | Log groups |
 | **Organizations** | Org structure, master account, all member accounts |
 
+### Role Trust Analysis
+
+- Enumerates all IAM role trust policies in the account
+- Flags wildcard trusts and external (cross-account) trust relationships
+
+### Environment Variable Extraction
+
+- Pulls environment variables from Lambda function configurations and ECS task definitions
+- Surfaces credentials, API keys, and connection strings embedded in runtime config
+
+### Loot Generation
+
+- Auto-generates actionable command lists based on enumeration results
+- Includes S3 access commands, SSM session/RCE commands, terraform state pulls
+- Saved as `loot_<account>.txt` in the output directory
+
 ### Role Assumption & Privilege Escalation
 
-- Auto-assumes configurable role across own account + discovered org accounts + user-provided accounts
-- Compares privilege levels between base credential and assumed roles
-- Automatically uses the most privileged credential for enumeration
+- Auto-assumes configurable role across own account or user-provided accounts
+- With `--org-enum`, discovers all org accounts and assumes into each child account
 - Full sub-enumeration (EKS, S3, SSM, Secrets Manager) in each assumed account
+- Priv simulation auto-converts session ARNs to role ARNs for assumed roles
 
 ## Usage
 
@@ -71,6 +88,18 @@ python3 aws_enum.py -f creds.txt --fast
 # Stealth mode (skip noisy checks, add jitter)
 python3 aws_enum.py -f creds.txt --stealth
 
+# Load creds from AWS CLI profile
+python3 aws_enum.py --profile my-profile
+
+# Organization-wide enumeration (discovers + assumes into all child accounts)
+python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --org-enum
+
+# Org enum with custom role name per account
+python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --org-enum --org-role CustomAdminRole
+
+# Only pull secrets, skip all other enumeration
+python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --pull-secrets-only
+
 # Via proxychains
 proxychains python3 aws_enum.py -f creds.txt -o results.json
 ```
@@ -89,16 +118,21 @@ AKIAXXXXXXXXXXXXXXXX:secretkeyhere:optionalsessiontoken
 |---|---|
 | `-c`, `--cred` | Single credential (`KEY:SECRET` or `KEY:SECRET:TOKEN`) |
 | `-f`, `--file` | File with credentials (one per line) |
+| `--profile` | Load credentials from an AWS CLI profile (`~/.aws/credentials`) |
+| `-a`, `--all` | Run all credentials from file without interactive selection |
 | `-r`, `--region` | Anchor region for STS calls (default: `us-east-1`) |
-| `--all-regions` | Check all 14 AWS regions (slower) |
+| `--all-regions` | Check all AWS regions (slower) |
 | `--fast` | Skip IAM privilege simulation |
 | `--stealth` | Skip noisy checks, add random jitter, limit cross-account |
 | `--timeout` | Request timeout in seconds (default: 10) |
 | `--no-assume` | Skip role assumption |
 | `--role-name` | Role to attempt assumption (default: `atmos-bootstrap-role`) |
-| `--accounts` | Comma-separated account IDs (or `ID:alias`) |
+| `--accounts` | Comma-separated account IDs (or `ID:alias`). Only tries these accounts (does not auto-add own) |
 | `--accounts-file` | File with account IDs |
+| `--org-enum` | Discover all org accounts and assume into each child account for full enumeration |
+| `--org-role` | Role to assume per org account (default: `OrganizationAccountAccessRole`) |
 | `--pull-secrets` | Pull actual SSM/SM secret values (default: names only) |
+| `--pull-secrets-only` | Skip all enumeration — only pull SSM params and SM secrets across all regions |
 | `-o`, `--output` | JSON output path (auto-names if omitted) |
 | `--out-dir` | Output directory |
 
@@ -113,6 +147,7 @@ aws_enum_YYYYMMDD_HHMMSS/
   ssm_secrets_<account>_<region>.txt   # SSM values (if --pull-secrets)
   sm_names_<account>_<region>.txt      # Secrets Manager names
   sm_secrets_<account>_<region>.txt    # SM values (if --pull-secrets)
+  loot_<account>.txt                   # Actionable exploit commands
 ```
 
 ## OPSEC
@@ -122,6 +157,7 @@ aws_enum_YYYYMMDD_HHMMSS/
 - `--stealth` mode skips `SimulatePrincipalPolicy`, `SendCommand` tests, and cross-account role attempts; adds random jitter
 - `--no-assume` avoids `AssumeRole` CloudTrail events entirely
 - `SendCommand` test uses a fake instance ID — will show as `InvalidInstanceId` in CloudTrail, not actual command execution
+- AWS China (`aws-cn`) keys are auto-detected — on `InvalidClientTokenId`, retries against `cn-northwest-1` and switches to China partition endpoints
 - Works with `proxychains` out of the box
 
 ## Requirements
