@@ -1301,10 +1301,62 @@ def check_env_vars(key_id, secret, token, region, timeout):
     return result
 
 
-def check_role_trusts(key_id, secret, token, region, timeout):
-    """Analyze IAM role trust policies for overpermissive or external trusts."""
+def _trust_matches_identity(trust_doc, current_arn, current_account):
+    """Return True if the role's trust policy allows the current identity to assume it."""
+    if not current_arn:
+        return False
+
+    # For assumed-role sessions derive the underlying role ARN for comparison
+    assumed_role_arn = None
+    if ":assumed-role/" in current_arn:
+        import re
+        m = re.match(r"arn:(aws[\w-]*):sts::(\d+):assumed-role/([^/]+)/", current_arn)
+        if m:
+            assumed_role_arn = f"arn:{m.group(1)}:iam::{m.group(2)}:role/{m.group(3)}"
+
+    account_root = f"arn:aws:iam::{current_account}:root" if current_account else None
+    account_root_cn = f"arn:aws-cn:iam::{current_account}:root" if current_account else None
+
+    for stmt in trust_doc.get("Statement", []):
+        if stmt.get("Effect") != "Allow":
+            continue
+        principal = stmt.get("Principal", {})
+
+        # Wildcard
+        if principal == "*" or principal == {"AWS": "*"}:
+            return True
+
+        aws_principals = principal.get("AWS", [])
+        if isinstance(aws_principals, str):
+            aws_principals = [aws_principals]
+
+        for p in aws_principals:
+            if p == "*":
+                return True
+            # Exact ARN match (user, role, or session)
+            if p == current_arn:
+                return True
+            # Underlying role ARN for assumed-role sessions
+            if assumed_role_arn and p == assumed_role_arn:
+                return True
+            # Account root principal — any identity in the account qualifies
+            if account_root and p == account_root:
+                return True
+            if account_root_cn and p == account_root_cn:
+                return True
+            # Bare account ID
+            if current_account and p == current_account:
+                return True
+
+    return False
+
+
+def check_role_trusts(key_id, secret, token, region, timeout, current_arn=None, current_account=None):
+    """Analyze IAM role trust policies for overpermissive or external trusts,
+    and identify roles the current identity can assume."""
     client = make_client("iam", key_id, secret, token, region, timeout)
-    result = {"external_trusts": [], "wildcard_trusts": [], "service_trusts": [], "total_roles": 0}
+    result = {"external_trusts": [], "wildcard_trusts": [], "service_trusts": [],
+              "assumable_roles": [], "total_roles": 0}
 
     roles, err = safe(client.list_roles, MaxItems=200)
     if not roles:
@@ -1359,6 +1411,13 @@ def check_role_trusts(key_id, secret, token, region, timeout):
                     "role": role_name,
                     "service": svc,
                 })
+
+        # Check if current identity can assume this role
+        if _trust_matches_identity(trust_doc, current_arn, current_account):
+            result["assumable_roles"].append({
+                "role": role_name,
+                "arn": role_arn,
+            })
 
     return result
 
@@ -1472,6 +1531,11 @@ def generate_loot(result, out_dir, account_id):
 
     # Role assumption commands
     role_trusts = result.get("role_trusts", {})
+    if role_trusts.get("assumable_roles"):
+        loot_lines.append("# ── Assumable Roles (trust policy matches your identity) ─")
+        for ar in role_trusts["assumable_roles"]:
+            loot_lines.append(f"aws sts assume-role --role-arn {ar['arn']} --role-session-name pwn")
+        loot_lines.append("")
     if role_trusts.get("wildcard_trusts"):
         loot_lines.append("# ── Wildcard Trust Roles (anyone can assume) ─────────")
         for rt in role_trusts["wildcard_trusts"]:
@@ -2238,10 +2302,17 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
     # [15] Role trust analysis
     print(f"{ts()} [15] Role trust analysis...", flush=True)
-    role_trusts = check_role_trusts(key_id, secret, token, region, timeout)
+    current_arn = identity.get("arn") if identity else None
+    current_account = identity.get("account") if identity else None
+    role_trusts = check_role_trusts(key_id, secret, token, region, timeout,
+                                    current_arn=current_arn, current_account=current_account)
     result["role_trusts"] = role_trusts
     if "error" not in role_trusts:
         print(f"{ts()}   Total roles    : {role_trusts['total_roles']}", flush=True)
+        if role_trusts.get("assumable_roles"):
+            print(f"{ts()}   ✓ ASSUMABLE   : {len(role_trusts['assumable_roles'])} roles you can assume", flush=True)
+            for ar in role_trusts["assumable_roles"]:
+                print(f"{ts()}     → {ar['role']}", flush=True)
         if role_trusts.get("wildcard_trusts"):
             print(f"{ts()}   ⚠ WILDCARD    : {len(role_trusts['wildcard_trusts'])} roles (anyone can assume!)", flush=True)
             for wt in role_trusts["wildcard_trusts"][:5]:
@@ -2253,7 +2324,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
                 print(f"{ts()}     {et['role']} ← {et['external_principal']}", flush=True)
             if len(role_trusts["external_trusts"]) > 5:
                 print(f"{ts()}     ... and {len(role_trusts['external_trusts'])-5} more", flush=True)
-        if not role_trusts.get("wildcard_trusts") and not role_trusts.get("external_trusts"):
+        if not role_trusts.get("wildcard_trusts") and not role_trusts.get("external_trusts") and not role_trusts.get("assumable_roles"):
             print(f"{ts()}   No overpermissive trusts found", flush=True)
     else:
         print(f"{ts()}   ✗ {role_trusts['error']}", flush=True)
@@ -2325,6 +2396,9 @@ def print_summary(all_results, out_dir=None):
             out(f"  │  ⚠ RCE       : SSM SendCommand ALLOWED in {', '.join(rce_regions)}")
         if ssm_inst > 0 and not rce_regions:
             out(f"  │  SSM targets  : {ssm_inst} managed instances (SendCommand not tested or denied)")
+        assumable = r.get("role_trusts", {}).get("assumable_roles", [])
+        if assumable:
+            out(f"  │  Assumable    : ✓ {len(assumable)} role(s) — {', '.join(a['role'] for a in assumable[:3])}{'...' if len(assumable) > 3 else ''}")
         if assumed:
             out(f"  │  Role assumed : ⚠ {assumed} account(s)")
         if hv:
