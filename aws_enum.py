@@ -518,11 +518,17 @@ DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-2", "eu-central-1", "ap-so
 CN_ALL_REGIONS = ["cn-north-1", "cn-northwest-1"]
 CN_DEFAULT_REGIONS = ["cn-north-1", "cn-northwest-1"]
 
+# AWS GovCloud (US) partition
+GOV_ALL_REGIONS = ["us-gov-west-1", "us-gov-east-1"]
+GOV_DEFAULT_REGIONS = ["us-gov-west-1", "us-gov-east-1"]
+
 
 def detect_partition(arn):
-    """Detect AWS partition from ARN. Returns 'aws-cn' for China, 'aws' otherwise."""
+    """Detect AWS partition from ARN. Returns 'aws-cn' for China, 'aws-us-gov' for GovCloud, 'aws' otherwise."""
     if arn and ":aws-cn:" in arn:
         return "aws-cn"
+    if arn and ":aws-us-gov:" in arn:
+        return "aws-us-gov"
     return "aws"
 
 
@@ -535,12 +541,18 @@ def regions_for_partition(partition, all_regions=False):
     """Return region lists appropriate for the partition."""
     if partition == "aws-cn":
         return CN_ALL_REGIONS if all_regions else CN_DEFAULT_REGIONS
+    if partition == "aws-us-gov":
+        return GOV_ALL_REGIONS if all_regions else GOV_DEFAULT_REGIONS
     return ALL_REGIONS if all_regions else DEFAULT_REGIONS
 
 
 def org_region(partition):
     """Organizations API endpoint region per partition."""
-    return "cn-northwest-1" if partition == "aws-cn" else "us-east-1"
+    if partition == "aws-cn":
+        return "cn-northwest-1"
+    if partition == "aws-us-gov":
+        return "us-gov-west-1"
+    return "us-east-1"
 
 
 def ts():
@@ -549,14 +561,14 @@ def ts():
 
 def banner():
     print("""
-\033[38;5;118m\033[1m  ╔════════════════════════════════════════════════════════════════════════╗
+\033[38;5;118m\033[1m  ╔═══════════════════════════════════════════════════════════════════════╗
   ║  ██████  ██   ██  ██████       ███████ ███    ██ ██    ██ ███    ███  ║
   ║ ██    ██ ██   ██ ██            ██      ████   ██ ██    ██ ████  ████  ║
   ║ ████████ ██ █ ██  █████  ████  █████   ██ ██  ██ ██    ██ ██ ████ ██  ║
   ║ ██    ██ ██████       ██       ██      ██  ██ ██ ██    ██ ██  ██  ██  ║
   ║ ██    ██  ████   ██████        ███████ ██   ████  ██████  ██      ██  ║
   ║\033[0m\033[38;5;135m  AWS Credential Enumerator  //  red team use only                     \033[38;5;118m\033[1m║
-  ╚════════════════════════════════════════════════════════════════════════╝\033[0m
+  ╚═══════════════════════════════════════════════════════════════════════╝\033[0m
 """)
 
 
@@ -733,17 +745,25 @@ def check_identity(key_id, secret, token, region, timeout):
     client = make_client("sts", key_id, secret, token, region, timeout)
     result, err = safe(client.get_caller_identity)
     if err:
-        # China keys fail against standard endpoints — retry cn-northwest-1
-        if err in ("InvalidClientTokenId", "SignatureDoesNotMatch") and not region.startswith("cn-"):
-            client = make_client("sts", key_id, secret, token, "cn-northwest-1", timeout)
-            result, err = safe(client.get_caller_identity)
+        # China/GovCloud keys fail against standard endpoints — retry their partition region
+        if err in ("InvalidClientTokenId", "SignatureDoesNotMatch") and not region.startswith(("cn-", "us-gov-")):
+            for retry_region in ("cn-northwest-1", "us-gov-west-1"):
+                client = make_client("sts", key_id, secret, token, retry_region, timeout)
+                result, err = safe(client.get_caller_identity)
+                if not err:
+                    break
             if err:
                 return None, err
         else:
             return None, err
 
-    # Get account alias — use cn-northwest-1 for China ARNs
-    iam_region = "cn-northwest-1" if ":aws-cn:" in result["Arn"] else region
+    # Get account alias — use the matching partition region for China/GovCloud ARNs
+    if ":aws-cn:" in result["Arn"]:
+        iam_region = "cn-northwest-1"
+    elif ":aws-us-gov:" in result["Arn"]:
+        iam_region = "us-gov-west-1"
+    else:
+        iam_region = region
     iam = make_client("iam", key_id, secret, token, iam_region, timeout)
     aliases, _ = safe(iam.list_account_aliases)
     alias = aliases["AccountAliases"][0] if aliases and aliases.get("AccountAliases") else None
@@ -1137,7 +1157,7 @@ def check_secrets_manager(key_id, secret, token, region, timeout,
 
 
 def check_org(key_id, secret, token, region, timeout, partition="aws"):
-    # Organizations API must target us-east-1 (or cn-northwest-1 for China)
+    # Organizations API must target us-east-1 (or cn-northwest-1 / us-gov-west-1 per partition)
     client = make_client("organizations", key_id, secret, token, org_region(partition), timeout)
     org, err = safe(client.describe_organization)
     if err:
@@ -1316,6 +1336,7 @@ def _trust_matches_identity(trust_doc, current_arn, current_account):
 
     account_root = f"arn:aws:iam::{current_account}:root" if current_account else None
     account_root_cn = f"arn:aws-cn:iam::{current_account}:root" if current_account else None
+    account_root_gov = f"arn:aws-us-gov:iam::{current_account}:root" if current_account else None
 
     for stmt in trust_doc.get("Statement", []):
         if stmt.get("Effect") != "Allow":
@@ -1343,6 +1364,8 @@ def _trust_matches_identity(trust_doc, current_arn, current_account):
             if account_root and p == account_root:
                 return True
             if account_root_cn and p == account_root_cn:
+                return True
+            if account_root_gov and p == account_root_gov:
                 return True
             # Bare account ID
             if current_account and p == current_account:
@@ -1876,11 +1899,11 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     partition = detect_partition(identity["arn"])
     result["partition"] = partition
 
-    # Override regions for AWS China
-    if partition == "aws-cn":
+    # Override regions for AWS China / GovCloud
+    if partition in ("aws-cn", "aws-us-gov"):
         regions = regions_for_partition(partition, args.all_regions)
         if region == "us-east-1":  # default wasn't overridden by user
-            region = "cn-northwest-1"
+            region = "cn-northwest-1" if partition == "aws-cn" else "us-gov-west-1"
 
     print(f"{ts()}   ✓ ARN     : {identity['arn']}", flush=True)
     print(f"{ts()}   ✓ Account : {account_id} ({identity.get('account_alias') or 'no alias'})", flush=True)
@@ -2590,7 +2613,7 @@ if __name__ == "__main__":
                 base_cred = next((c for c in creds if c[0] == base_key_id), creds[0])
                 base_key, base_secret = base_cred[0], base_cred[1]
                 base_token = base_cred[2] if len(base_cred) > 2 else None
-                region = "cn-northwest-1" if partition == "aws-cn" else "us-east-1"
+                region = org_region(partition)
 
                 # Save original args state
                 saved_out_dir = args.out_dir

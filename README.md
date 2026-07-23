@@ -8,7 +8,7 @@ Red team AWS credential enumerator. Given AWS access key pairs, performs full id
 
 | Check | Details |
 |---|---|
-| **STS Identity** | ARN, account ID, alias, key type (AKIA/ASIA), root detection, AWS China auto-detection |
+| **STS Identity** | ARN, account ID, alias, key type (AKIA/ASIA), root detection, AWS China/GovCloud auto-detection |
 | **IAM User** | Username, groups, policies (attached + inline), access keys, creation date |
 | **IAM Visibility** | Visible users, visible roles across the account |
 | **Privilege Simulation** | 60+ IAM actions tested via `SimulatePrincipalPolicy`, high-value permissions flagged. Auto-converts session ARNs to role ARNs for assumed roles |
@@ -157,7 +157,7 @@ aws_enum_YYYYMMDD_HHMMSS/
 - `--stealth` mode skips `SimulatePrincipalPolicy`, `SendCommand` tests, and cross-account role attempts; adds random jitter
 - `--no-assume` avoids `AssumeRole` CloudTrail events entirely
 - `SendCommand` test uses a fake instance ID — will show as `InvalidInstanceId` in CloudTrail, not actual command execution
-- AWS China (`aws-cn`) keys are auto-detected — on `InvalidClientTokenId`, retries against `cn-northwest-1` and switches to China partition endpoints
+- AWS China (`aws-cn`) and GovCloud (`aws-us-gov`) keys are auto-detected — on `InvalidClientTokenId`/`SignatureDoesNotMatch`, retries against `cn-northwest-1`/`us-gov-west-1` and switches to the matching partition endpoints
 - Works with `proxychains` out of the box
 
 ## Requirements
