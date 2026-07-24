@@ -2040,7 +2040,8 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
                 risk_color = "⚠" if p["risk"] == "CRITICAL" else "→"
                 print(f"{ts()}   {risk_color} [{p['risk']}] {p['name']}", flush=True)
                 print(f"{ts()}     Actions : {', '.join(p['matched_actions'])}", flush=True)
-                print(f"{ts()}     Exploit : {p['exploit'][:120]}", flush=True)
+                exploit = p['exploit']
+                print(f"{ts()}     Exploit : {exploit[:120]}{'...' if len(exploit) > 120 else ''}", flush=True)
                 if p.get("targets"):
                     print(f"{ts()}     Targets : {', '.join(p['targets'][:5])}{'...' if len(p.get('targets',[])) > 5 else ''}", flush=True)
                 if p.get("assumable_roles"):
@@ -2298,7 +2299,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     if env_total_lambda == 0 and env_total_ecs == 0:
         print(f"{ts()}   No env vars accessible", flush=True)
     else:
-        print(f"{ts()}   Total: {env_total_lambda} Lambda, {env_total_ecs} ECS — {env_interesting} interesting vars", flush=True)
+        print(f"{ts()}   Total: {env_total_lambda} Lambda (with env vars), {env_total_ecs} ECS — {env_interesting} interesting vars", flush=True)
 
     # Save env vars to file if any found
     if result["env_vars"]:
