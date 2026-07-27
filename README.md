@@ -100,6 +100,12 @@ python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --org-enum --org-role CustomAdminR
 # Only pull secrets, skip all other enumeration
 python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --pull-secrets-only
 
+# Only check identity + try role assumption, skip all other enumeration
+python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --role-name my-admin-role --assume-only
+
+# Assume-only across multiple candidate accounts (tries all, doesn't stop at first success)
+python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --role-name my-admin-role --accounts 123456789012,987654321098 --assume-only
+
 # Via proxychains
 proxychains python3 aws_enum.py -f creds.txt -o results.json
 ```
@@ -129,6 +135,7 @@ AKIAXXXXXXXXXXXXXXXX:secretkeyhere:optionalsessiontoken
 | `--role-name` | Role to attempt assumption (default: `atmos-bootstrap-role`) |
 | `--accounts` | Comma-separated account IDs (or `ID:alias`). Only tries these accounts (does not auto-add own) |
 | `--accounts-file` | File with account IDs |
+| `--assume-only` | Check identity, try assuming `--role-name`, then stop — skips all other enumeration. Requires `--role-name`, incompatible with `--no-assume` |
 | `--org-enum` | Discover all org accounts and assume into each child account for full enumeration |
 | `--org-role` | Role to assume per org account (default: `OrganizationAccountAccessRole`) |
 | `--pull-secrets` | Pull actual SSM/SM secret values (default: names only) |

@@ -608,6 +608,10 @@ Examples:
   Skip role assumption:
     python3 aws_enum.py -f creds.txt --no-assume
 
+  Only check identity + try role assumption (skip all other enumeration):
+    python3 aws_enum.py -c AKIAXXXXXXXX:secretkey --role-name my-admin-role --assume-only
+    python3 aws_enum.py -f creds.txt --role-name my-admin-role --accounts 123456789012 --assume-only
+
   Fast mode (skip priv simulation):
     python3 aws_enum.py -f creds.txt --fast
 
@@ -652,6 +656,12 @@ Examples:
                              "Example: 123456789012,987654321098:staging")
     assume.add_argument("--accounts-file",
                         help="File with account IDs, one per line (ID or ID:alias)")
+    assume.add_argument("--assume-only", action="store_true",
+                        help="Only check identity, then attempt role assumption — skip all other "
+                             "enumeration (IAM, S3, EC2, EKS, ECR, SSM, Secrets Manager, RDS, Lambda, "
+                             "Logs, Organizations, env vars, role trusts, loot). Requires --role-name "
+                             "and is incompatible with --no-assume. Prints the resulting identity for "
+                             "each account tried and saves a minimal JSON result.")
 
     org = parser.add_argument_group("Organization Enumeration")
     org.add_argument("--org-enum", action="store_true",
@@ -681,6 +691,12 @@ Examples:
 
     if not args.cred and not args.file and not args.profile:
         parser.error("Provide --cred, --file, or --profile")
+
+    if args.assume_only:
+        if args.no_assume:
+            parser.error("--assume-only is incompatible with --no-assume")
+        if not args.role_name:
+            parser.error("--assume-only requires --role-name")
 
     return args
 
@@ -1951,6 +1967,40 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     if identity.get("is_root"):
         print(f"{ts()}   ⚠ ROOT ACCOUNT", flush=True)
 
+    # [1b] Assume-only mode — check identity, try role assumption, stop there
+    if getattr(args, "assume_only", False):
+        if extra_accounts:
+            assume_accounts = dict(extra_accounts)
+        else:
+            assume_accounts = {account_id: f"account-{account_id}"}
+
+        print(f"{ts()} [1b] Assume-only — trying {args.role_name} in "
+              f"{len(assume_accounts)} account(s)...", flush=True)
+
+        attempts = []
+        for acct_id, alias in assume_accounts.items():
+            jitter(getattr(args, "stealth", False))
+            print(f"{ts()}   Trying {args.role_name} @ {alias} ({acct_id})...", flush=True)
+            creds_tuple = try_assume_role(key_id, secret, token, region, timeout, args.role_name, acct_id, partition)
+            if creds_tuple:
+                ak, sk, st, role_arn = creds_tuple
+                assumed_identity, _ = check_identity(ak, sk, st, region, timeout)
+                arn = assumed_identity["arn"] if assumed_identity else role_arn
+                print(f"{ts()}   ✓ Assumed {role_arn}", flush=True)
+                print(f"{ts()}     ARN: {arn}", flush=True)
+                attempts.append({"account": acct_id, "alias": alias, "role_arn": role_arn,
+                                  "status": "SUCCESS", "assumed_arn": arn})
+            else:
+                print(f"{ts()}   ✗ Denied", flush=True)
+                attempts.append({"account": acct_id, "alias": alias,
+                                  "role_arn": f"arn:{partition}:iam::{acct_id}:role/{args.role_name}",
+                                  "status": "DENIED"})
+
+        succeeded = sum(1 for a in attempts if a["status"] == "SUCCESS")
+        result["assume_attempts"] = attempts
+        print(f"{ts()}   {succeeded}/{len(attempts)} assumption(s) succeeded", flush=True)
+        return result
+
     # [1b] Role assumption — assume into target accounts, then enumerate with assumed creds
     if not args.no_assume and args.role_name:
         # If user explicitly specified accounts, only try those.
@@ -2382,6 +2432,20 @@ def print_summary(all_results, out_dir=None):
 
     for r in valid:
         ident = r.get("identity", {})
+
+        if "assume_attempts" in r:
+            attempts = r["assume_attempts"]
+            succeeded = [a for a in attempts if a["status"] == "SUCCESS"]
+            out(f"\n  ┌─ {r['key_id']}")
+            out(f"  │  ARN          : {ident.get('arn','N/A')}")
+            out(f"  │  Assume-only  : {len(succeeded)}/{len(attempts)} succeeded")
+            for a in attempts:
+                marker = "✓" if a["status"] == "SUCCESS" else "✗"
+                extra = f" — {a['assumed_arn']}" if a.get("assumed_arn") else ""
+                out(f"  │    {marker} {a['alias']} ({a['account']}){extra}")
+            out(f"  └{'─'*50}")
+            continue
+
         eks = {k: v for k, v in r.get("eks", {}).items() if not k.endswith("_details")}
         eks_count = sum(len(v) for v in eks.values())
         assumed = sum(1 for v in r.get("role_assumption", {}).values()
