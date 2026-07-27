@@ -123,7 +123,7 @@ AKIAXXXXXXXXXXXXXXXX:secretkeyhere:optionalsessiontoken
 | `-r`, `--region` | Anchor region for STS calls (default: `us-east-1`) |
 | `--all-regions` | Check all AWS regions (slower) |
 | `--fast` | Skip IAM privilege simulation |
-| `--stealth` | Skip noisy checks, add random jitter, limit cross-account |
+| `--stealth` | Skip `SimulatePrincipalPolicy`/`SendCommand` test, jitter every check/region/resource boundary |
 | `--timeout` | Request timeout in seconds (default: 10) |
 | `--no-assume` | Skip role assumption |
 | `--role-name` | Role to attempt assumption (default: `atmos-bootstrap-role`) |
@@ -154,7 +154,7 @@ aws_enum_YYYYMMDD_HHMMSS/
 
 - **Read-only by default** — enumeration only, no modifications
 - `--pull-secrets` reads SSM/SM values (generates `GetParameter`/`GetSecretValue` CloudTrail events)
-- `--stealth` mode skips `SimulatePrincipalPolicy`, `SendCommand` tests, and cross-account role attempts; adds random jitter
+- `--stealth` mode skips `SimulatePrincipalPolicy` and the `SendCommand` RCE test outright, and adds random jitter at every check/region/account boundary (0.5-2.5s) plus every per-resource call — S3 buckets, SSM params, SM secrets, ECS task defs, role-assumption attempts (0.1-0.4s) — to break up the single-principal CloudTrail call-volume burst that GuardDuty's anomaly-detection models (`CredentialAccess:IAMUser/AnomalousBehavior`, `Recon:IAMUser/*`) and velocity-based CloudWatch alarms key off of. It throttles requested cross-account role assumption (`--accounts`/`--org-enum`) rather than skipping it, and does not reduce enumeration scope — same coverage, slower and spread out
 - `--no-assume` avoids `AssumeRole` CloudTrail events entirely
 - `SendCommand` test uses a fake instance ID — will show as `InvalidInstanceId` in CloudTrail, not actual command execution
 - AWS China (`aws-cn`) and GovCloud (`aws-us-gov`) keys are auto-detected — on `InvalidClientTokenId`/`SignatureDoesNotMatch`, retries against `cn-northwest-1`/`us-gov-west-1` and switches to the matching partition endpoints

