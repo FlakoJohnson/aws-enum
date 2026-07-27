@@ -1503,7 +1503,7 @@ def generate_loot(result, out_dir, account_id, key_id=None, secret=None, token=N
     if s3.get("all"):
         loot_lines.append("# ── S3 Buckets ─────────────────────────────────────────")
         for b in s3["all"]:
-            loot_lines.append(f"aws s3 ls s3://{b}/ --max-items 20")
+            loot_lines.append(f"aws s3 ls s3://{b}/ | head -20")
         loot_lines.append("")
         if s3.get("terraform_buckets"):
             loot_lines.append("# Terraform state (may contain secrets):")
